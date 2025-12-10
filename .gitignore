@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.xlsx
+*.csv
 .Python
 env/
 venv/
