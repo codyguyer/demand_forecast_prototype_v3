@@ -1,0 +1,346 @@
+import warnings
+import time
+from typing import List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_absolute_error
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+# Suppress noisy convergence messages while grid searching
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
+SEASONAL_PERIOD = 12  # monthly data with annual seasonality
+DEFAULT_D = 1
+DEFAULT_D_SEASONAL = 1
+MAX_P = 2
+MAX_Q = 2
+MAX_P_SEASONAL = 1
+MAX_Q_SEASONAL = 1
+
+# Rolling-origin CV settings
+ROCV_HORIZON = 6   # forecast horizon per split (months)
+ROCV_SPLITS = 3    # number of rolling splits
+
+# Holdout evaluation
+TOP_N_CANDIDATES = 5
+HOLDOUT_HORIZON = 12
+MIN_TRAIN_FOR_HOLDOUT = 24
+MIN_SERIES_LENGTH = 36  # guardrail to skip very short series
+
+
+# --------------------------------------------------
+# 1. ORDER GRID
+# --------------------------------------------------
+def build_order_grid(
+    max_p: int = MAX_P,
+    max_q: int = MAX_Q,
+    max_P: int = MAX_P_SEASONAL,
+    max_Q: int = MAX_Q_SEASONAL,
+    d: int = DEFAULT_D,
+    D: int = DEFAULT_D_SEASONAL,
+    m: int = SEASONAL_PERIOD,
+) -> List[Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]]:
+    """Enumerate (p,d,q)(P,D,Q,m) combinations."""
+    orders = []
+    for p in range(max_p + 1):
+        for q in range(max_q + 1):
+            for P in range(max_P + 1):
+                for Q in range(max_Q + 1):
+                    if (p, d, q) == (0, 0, 0) and (P, D, Q, m) == (0, 0, 0, m):
+                        continue
+                    orders.append(((p, d, q), (P, D, Q, m)))
+    return orders
+
+
+# --------------------------------------------------
+# 2. UTILS: ROCV SPLITS
+# --------------------------------------------------
+def generate_rocv_splits(n_obs: int, horizon: int = ROCV_HORIZON, n_splits: int = ROCV_SPLITS):
+    """Rolling-origin splits; returns a list of (train_end, test_end) indices."""
+    splits = []
+    total_needed = horizon * n_splits + horizon
+    if n_obs < total_needed:
+        n_splits = max(1, (n_obs // horizon) - 1)
+
+    for i in range(n_splits):
+        test_end = n_obs - (n_splits - (i + 1)) * horizon
+        train_end = test_end - horizon
+        if train_end <= horizon:
+            continue
+        splits.append((train_end, test_end))
+    return splits
+
+
+# --------------------------------------------------
+# 3. FIT + EVALUATE A SINGLE ORDER
+# --------------------------------------------------
+def evaluate_sarimax_order(
+    y: pd.Series,
+    exog: Optional[pd.DataFrame],
+    order: Tuple[int, int, int],
+    seasonal_order: Tuple[int, int, int, int],
+) -> dict:
+    results = {
+        "order": order,
+        "seasonal_order": seasonal_order,
+        "converged": False,
+        "in_sample_MAE": np.nan,
+        "rocv_MAE": np.nan,
+        "AIC": np.nan,
+        "BIC": np.nan,
+    }
+
+    try:
+        model = SARIMAX(
+            y,
+            exog=exog,
+            order=order,
+            seasonal_order=seasonal_order,
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        )
+        fit_res = model.fit(disp=False, maxiter=200)
+    except Exception:
+        return results
+
+    # In-sample fit quality
+    fitted = fit_res.fittedvalues
+    y_aligned, fitted_aligned = y.align(fitted, join="inner")
+    in_sample_mae = mean_absolute_error(y_aligned, fitted_aligned)
+
+    # Information criteria
+    aic = fit_res.aic
+    bic = fit_res.bic
+
+    # Rolling-origin CV
+    n_obs = len(y)
+    splits = generate_rocv_splits(n_obs)
+    rocv_maes = []
+    for train_end, test_end in splits:
+        y_train = y.iloc[:train_end]
+        y_test = y.iloc[train_end:test_end]
+        exog_train = exog.iloc[:train_end, :] if exog is not None else None
+        exog_test = exog.iloc[train_end:test_end, :] if exog is not None else None
+
+        try:
+            model_cv = SARIMAX(
+                y_train,
+                exog=exog_train,
+                order=order,
+                seasonal_order=seasonal_order,
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            )
+            fit_cv = model_cv.fit(disp=False, maxiter=200)
+            forecast = fit_cv.forecast(steps=len(y_test), exog=exog_test)
+            rocv_maes.append(mean_absolute_error(y_test, forecast))
+        except Exception:
+            rocv_maes = []
+            break
+
+    rocv_mae = np.nanmean(rocv_maes) if rocv_maes else np.nan
+
+    results.update(
+        {
+            "converged": True,
+            "in_sample_MAE": in_sample_mae,
+            "rocv_MAE": rocv_mae,
+            "AIC": aic,
+            "BIC": bic,
+        }
+    )
+    return results
+
+
+# --------------------------------------------------
+# 4. CHOOSE BEST MODEL FOR ONE SKU
+# --------------------------------------------------
+def evaluate_holdout_horizon(
+    y: pd.Series,
+    exog: Optional[pd.DataFrame],
+    order: Tuple[int, int, int],
+    seasonal_order: Tuple[int, int, int, int],
+    horizon: int = HOLDOUT_HORIZON,
+    min_train: int = MIN_TRAIN_FOR_HOLDOUT,
+) -> float:
+    """Evaluate a single order on a final holdout block."""
+    n_obs = len(y)
+    if n_obs <= horizon + min_train:
+        return np.nan
+
+    train_end = n_obs - horizon
+    y_train = y.iloc[:train_end]
+    y_test = y.iloc[train_end:]
+    exog_train = exog.iloc[:train_end, :] if exog is not None else None
+    exog_test = exog.iloc[train_end:, :] if exog is not None else None
+
+    try:
+        model = SARIMAX(
+            y_train,
+            exog=exog_train,
+            order=order,
+            seasonal_order=seasonal_order,
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        )
+        fit_res = model.fit(disp=False, maxiter=200)
+        forecast = fit_res.forecast(steps=horizon, exog=exog_test)
+        holdout_mae = mean_absolute_error(y_test, forecast)
+        return holdout_mae
+    except Exception:
+        return np.nan
+
+
+def select_best_model_for_sku(y: pd.Series, exog: Optional[pd.DataFrame] = None):
+    """
+    Grid-search SARIMA/SARIMAX orders for a single SKU.
+    Returns (df_results, best_row_dict or None).
+    """
+    order_grid = build_order_grid()
+    all_results = []
+    for order, seasonal_order in order_grid:
+        metrics = evaluate_sarimax_order(y, exog, order, seasonal_order)
+        all_results.append(metrics)
+    df_results = pd.DataFrame(all_results)
+
+    df_valid = df_results[df_results["converged"] & df_results["rocv_MAE"].notna()].copy()
+    if df_valid.empty:
+        df_valid = df_results[df_results["converged"]].copy()
+    if df_valid.empty:
+        return df_results, None
+
+    df_valid = df_valid.sort_values(["rocv_MAE", "in_sample_MAE"], ascending=[True, True])
+    top_candidates = df_valid.head(TOP_N_CANDIDATES).copy()
+
+    holdout_maes = []
+    for _, row in top_candidates.iterrows():
+        order = tuple(row["order"])
+        seasonal_order = tuple(row["seasonal_order"])
+        holdout_mae = evaluate_holdout_horizon(
+            y,
+            exog,
+            order,
+            seasonal_order,
+            horizon=HOLDOUT_HORIZON,
+            min_train=MIN_TRAIN_FOR_HOLDOUT,
+        )
+        holdout_maes.append(holdout_mae)
+    top_candidates["holdout_MAE"] = holdout_maes
+
+    mask_valid_holdout = np.isfinite(top_candidates["holdout_MAE"])
+    if mask_valid_holdout.any():
+        df_h = top_candidates[mask_valid_holdout].copy().sort_values("holdout_MAE")
+        best_row = df_h.iloc[0].to_dict()
+    else:
+        best_row = top_candidates.iloc[0].to_dict()
+
+    return df_results, best_row
+
+
+# --------------------------------------------------
+# 5. MASTER LOOP OVER PRODUCTS
+# --------------------------------------------------
+def run_order_search_for_all_products(
+    df: pd.DataFrame,
+    product_col: str = "Product",
+    division_col: str = "Division",
+    date_col: str = "Month",
+    target_col: str = "Actuals",
+    exog_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Run order search for every (product, division) pair."""
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col])
+    df = df.sort_values([product_col, division_col, date_col])
+
+    results_summary = []
+    for (prod, div), grp in df.groupby([product_col, division_col]):
+        grp = grp.set_index(date_col)
+        y = grp[target_col]
+        exog = grp[exog_cols] if exog_cols is not None else None
+
+        if len(y) < MIN_SERIES_LENGTH:
+            results_summary.append(
+                {
+                    "Product": prod,
+                    "Division": div,
+                    "Status": f"Too short (<{MIN_SERIES_LENGTH})",
+                    "Chosen_Order": None,
+                    "Chosen_Seasonal_Order": None,
+                    "Chosen_ROCV_MAE": np.nan,
+                    "Chosen_InSample_MAE": np.nan,
+                    "Chosen_Holdout_MAE": np.nan,
+                    "Chosen_AIC": np.nan,
+                    "Chosen_BIC": np.nan,
+                }
+            )
+            continue
+
+        print(f"Processing Product {prod}, Division {div} (n={len(y)})")
+        all_results, best = select_best_model_for_sku(y, exog)
+        if best is None:
+            results_summary.append(
+                {
+                    "Product": prod,
+                    "Division": div,
+                    "Status": "No converged models",
+                    "Chosen_Order": None,
+                    "Chosen_Seasonal_Order": None,
+                    "Chosen_ROCV_MAE": np.nan,
+                    "Chosen_InSample_MAE": np.nan,
+                    "Chosen_Holdout_MAE": np.nan,
+                    "Chosen_AIC": np.nan,
+                    "Chosen_BIC": np.nan,
+                }
+            )
+            continue
+
+        results_summary.append(
+            {
+                "Product": prod,
+                "Division": div,
+                "Status": "OK",
+                "Chosen_Order": best["order"],
+                "Chosen_Seasonal_Order": best["seasonal_order"],
+                "Chosen_ROCV_MAE": best.get("rocv_MAE", np.nan),
+                "Chosen_InSample_MAE": best.get("in_sample_MAE", np.nan),
+                "Chosen_Holdout_MAE": best.get("holdout_MAE", np.nan),
+                "Chosen_AIC": best.get("AIC", np.nan),
+                "Chosen_BIC": best.get("BIC", np.nan),
+            }
+        )
+
+    return pd.DataFrame(results_summary)
+
+
+# --------------------------------------------------
+# 6. EXAMPLE USAGE
+# --------------------------------------------------
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    combined_file = "all_products_with_sf_and_bookings.xlsx"
+    df_all = pd.read_excel(combined_file)
+
+    exog_columns = [
+        "Open_Opportunities",
+        "New_Quotes",
+        "Bookings",
+    ]
+
+    summary = run_order_search_for_all_products(
+        df_all,
+        product_col="Product",
+        division_col="Division",
+        date_col="Month",
+        target_col="Actuals",
+        exog_cols=exog_columns,
+    )
+    summary.to_excel("sarimax_order_search_summary.xlsx", index=False)
+    print("Saved sarimax_order_search_summary.xlsx")
+    elapsed = time.perf_counter() - t0
+    print(f"Total runtime: {elapsed:,.2f} seconds")

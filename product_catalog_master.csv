@@ -1,0 +1,285 @@
+group_key,business_unit_code,business_unit_name,sku_list,product_family,marketing_manager,salesforce_feature_mode,sarima_p,sarima_d,sarima_q,sarima_P,sarima_D,sarima_Q,sarima_s,Quantity_new_orders,Quantity,New_Quotes,sf_open_opportunities_lag,sf_revenue_lag,sf_revenue_new_orders_lag,
+204,D100,Medical,Prod_204,Medical Tables,August Boehnlein,quantity,1,0,1,0,1,0,12,6,0,0,0,0,0,0
+224,D100,Medical,Prod_224,Medical Tables,August Boehnlein,quantity,1,0,1,0,1,0,12,0,0,0,0,0,0,0
+225,D100,Medical,Prod_225,Medical Tables,August Boehnlein,quantity,1,1,1,0,1,0,12,0,0,0,0,0,0,0
+230,D100,Medical,Prod_230,Medical Tables,August Boehnlein,quantity,0,1,1,0,1,0,12,4,1,6,0,0,0,0
+244,D100,Medical,Prod_244,Medical Tables,August Boehnlein,quantity,0,1,1,0,0,0,12,4,0,5,0,0,0,0
+250,D100,Medical,PROD_50,Lights,August Boehnlein,quantity,1,0,0,0,1,0,12,4,3,6,0,0,0,0
+253,D100,Medical,Prod_53,Lights,August Boehnlein,quantity,0,0,1,0,1,0,12,5,5,0,0,0,0,0
+255,D100,Medical,prod_255,Lights,August Boehnlein,quantity,0,0,1,0,1,0,12,4,4,5,0,0,0,0
+425,D100,Medical,Prod_425,Seating,Kylie Gilbert,quantity,1,1,0,0,1,1,12,1,1,1,0,0,0,0
+626,D100,Medical,Prod_626,Medical Tables,August Boehnlein,quantity,1,1,1,0,1,0,12,5,6,0,0,0,0,0
+630,D100,Medical,Prod_630,Medical Tables,August Boehnlein,quantity,1,0,0,0,1,0,12,1,3,6,0,0,0,0
+631,D100,Medical,Prod_631,Medical Tables,August Boehnlein,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+640,D100,Medical,Prod_640,Medical Tables,August Boehnlein,quantity,0,0,1,0,1,0,12,3,5,6,0,0,0,0
+641,D100,Medical,Prod_641,Medical Tables,August Boehnlein,quantity,2,1,1,0,0,0,12,4,5,4,0,0,0,0
+646,D100,Medical,Prod_646,Medical Tables,August Boehnlein,quantity,0,0,1,0,0,1,12,4,6,6,0,0,0,0
+647,D100,Medical,Prod_647,Medical Tables,August Boehnlein,quantity,1,0,0,0,1,0,12,4,0,0,0,0,0,0
+1425,D100,Medical,Prod_1425,Upholstery,,quantity,0,1,1,0,1,1,12,0,0,0,0,0,0,0
+6214,D100,Medical,ITEM_3-004-2000|ITEM_3-009-0003,Workstations,Kylie Gilbert,quantity,0,0,1,0,1,0,12,3,2,6,0,0,0,0
+13300,D100,Medical,Prod_13300,Diagnostics,Brooke,dollars,0,1,1,0,1,0,12,0,0,0,0,0,0,0
+002-11176-00,D100,Medical,ITEM_002-11176-00,Diagnostics,Brooke,quantity,1,0,2,1,0,0,12,0,0,0,0,0,0,0
+002-11176-01,D100,Medical,ITEM_002-11176-01,Diagnostics,Brooke,quantity,2,1,0,0,1,0,12,0,0,0,0,0,0,0
+002-11176-02,D100,Medical,ITEM_002-11176-02,Diagnostics,Brooke,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+002-11176-03,D100,Medical,ITEM_002-11176-03,Diagnostics,Brooke,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+002-11177-00,D100,Medical,ITEM_002-11177-00,Diagnostics,Brooke,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+002-11177-01,D100,Medical,ITEM_002-11177-01,Diagnostics,Brooke,quantity,0,0,0,0,0,0,0,0,1,1,0,0,0,0
+002-11177-02,D100,Medical,ITEM_002-11177-02,Diagnostics,Brooke,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+002-11177-03,D100,Medical,ITEM_002-11177-03,Diagnostics,Brooke,quantity,0,0,0,0,0,0,0,1,1,1,0,0,0,0
+002-11178-00,D100,Medical,ITEM_002-11178-00,Diagnostics,Brooke,quantity,0,0,0,0,0,0,0,0,1,0,0,0,0,0
+002-11178-01,D100,Medical,ITEM_002-11178-01,Diagnostics,Brooke,quantity,1,0,2,1,0,0,12,6,6,6,0,0,0,0
+002-11178-02,D100,Medical,ITEM_002-11178-02,Diagnostics,Brooke,quantity,0,0,1,0,0,0,12,0,0,0,0,0,0,0
+002-11178-03,D100,Medical,ITEM_002-11178-03,Diagnostics,Brooke,quantity,0,0,0,0,0,0,0,1,2,2,0,0,0,0
+103/203,D100,Medical,103/203 Treatment Tables,Medical Tables,August Boehnlein,quantity,1,1,1,0,1,0,12,0,2,0,0,0,0,0
+204_FL Upholstery,D100,Medical,Prod_1204_FL,Upholstery,,quantity,1,0,1,0,1,0,12,0,0,0,0,0,0,0
+204_SM Upholstery,D100,Medical,Prod_1204_SM,Upholstery,,quantity,0,1,1,0,1,0,12,0,0,0,0,0,0,0
+204_ST Upholstery,D100,Medical,Prod_1204_ST,Upholstery,,quantity,0,0,1,0,1,0,12,0,0,0,0,0,0,0
+2-200-0082,D100,Medical,ITEM_2-200-0082,Diagnostics,Brooke,quantity,0,1,2,0,1,1,12,0,0,2,0,0,0,0
+2-200-0086,D100,Medical,Item_2-200-0086,Diagnostics,Brooke,quantity,2,1,1,0,1,1,12,3,4,4,0,0,0,0
+225_FL Upholstery,D100,Medical,Prod_1225_FL,Upholstery,,quantity,1,0,1,0,1,0,12,0,0,0,0,0,0,0
+225_SM Upholstery,D100,Medical,Prod_1225_SM,Upholstery,,quantity,0,1,1,0,1,0,12,0,0,0,0,0,0,0
+230_SM Upholstery,D100,Medical,prod_1230_SM,Upholstery,,quantity,0,1,1,0,1,0,12,0,0,0,0,0,0,0
+244_SM Upholstery,D100,Medical,prod_1244_SM,Upholstery,,quantity,1,1,0,0,1,1,12,0,0,0,0,0,0,0
+4-000-0540,D100,Medical,ITEM_4-000-0540,Diagnostics,Brooke,quantity,1,0,2,0,0,0,12,0,0,1,0,0,0,0
+4-000-0550,D100,Medical,ITEM_4-000-0550,Diagnostics,Brooke,quantity,0,1,2,0,1,1,12,2,0,2,0,0,0,0
+4-000-0620,D100,Medical,ITEM_4-000-0620,Diagnostics,Brooke,quantity,0,0,1,0,0,0,12,0,0,0,0,0,0,0
+4-000-0622,D100,Medical,ITEM_4-000-0622,Diagnostics,Brooke,quantity,0,0,2,0,0,0,12,0,0,0,0,0,0,0
+4-000-0624,D100,Medical,ITEM_4-000-0624,Diagnostics,Brooke,quantity,0,1,1,0,1,1,12,2,5,2,0,0,0,0
+4-000-0720,D100,Medical,ITEM_4-000-0720,Diagnostics,Brooke,quantity,2,0,0,0,0,0,12,0,0,0,0,0,0,0
+4-000-0722,D100,Medical,ITEM_4-000-0722,Diagnostics,Brooke,quantity,0,0,1,0,0,0,12,0,6,5,0,0,0,0
+4-000-0724,D100,Medical,ITEM_4-000-0724,Diagnostics,Brooke,quantity,2,1,1,0,1,0,12,5,1,4,0,0,0,0
+4-000-0801,D100,Medical,ITEM_4-000-0801,Diagnostics,Brooke,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+4-000-0802,D100,Medical,ITEM_4-000-0802,Diagnostics,Brooke,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+4-000-0803,D100,Medical,ITEM_4-000-0803,Diagnostics,Brooke,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+4-000-0804,D100,Medical,ITEM_4-000-0804,Diagnostics,Brooke,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+626_PM Upholstery,D100,Medical,Prod_1626_PM,Upholstery,,quantity,1,0,1,0,1,0,12,0,0,0,0,0,0,0
+626_S_WD,D100,Medical,prod_626_S_WD,Medical Tables,August Boehnlein,quantity,1,1,0,0,0,0,12,1,1,6,0,0,0,0
+626_S_WS,D100,Medical,prod_626_S_WS,Medical Tables,August Boehnlein,quantity,0,1,2,0,1,1,12,3,0,2,0,0,0,0
+630_PM Upholstery,D100,Medical,Prod_1630_PM,Upholstery,,quantity,1,1,1,0,1,0,12,0,0,0,0,0,0,0
+631_PM Upholstery,D100,Medical,Prod_1631_PM,Upholstery,,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+641_PM Upholstery,D100,Medical,prod_1641_PM,Upholstery,,quantity,0,0,1,0,1,0,12,0,0,0,0,0,0,0
+647_PM Upholstery,D100,Medical,prod_1647_PM,Upholstery,,quantity,0,0,1,0,1,0,12,0,0,0,0,0,0,0
+996_A,D100,Medical,Prod_996_A,Seating,Kylie Gilbert,quantity,1,0,1,0,1,0,12,6,2,2,0,0,0,0
+996_B,D100,Medical,Prod_996_B,Seating,Kylie Gilbert,quantity,0,0,1,0,1,0,12,0,4,6,0,0,0,0
+996_C,D100,Medical,Prod_996_C,Seating,Kylie Gilbert,quantity,0,1,1,0,1,0,12,0,0,0,0,0,0,0
+996_M,D100,Medical,Prod_996_M,Seating,Kylie Gilbert,quantity,1,0,0,0,1,0,12,6,6,4,0,0,0,0
+996_S,D100,Medical,Prod_996_S,Seating,Kylie Gilbert,quantity,0,0,1,0,1,0,12,5,2,1,0,0,0,0
+A-095-12-208-166,D100,Medical,ITEM_A-095-12-208-166,Diagnostics,Brooke,quantity,1,1,1,0,1,0,12,0,1,0,0,0,0,0
+A-095-12-209-166,D100,Medical,ITEM_A-095-12-209-166,Diagnostics,Brooke,quantity,1,0,0,0,0,0,12,0,0,0,0,0,0,0
+A-095-12-210-166,D100,Medical,ITEM_A-095-12-210-166,Diagnostics,Brooke,quantity,1,1,1,0,1,1,12,6,1,4,0,0,0,0
+A-095-12-930-166,D100,Medical,ITEM_A-095-12-930-166,Diagnostics,Brooke,quantity,0,1,1,0,1,1,12,6,6,2,0,0,0,0
+A-095-12-931-166,D100,Medical,ITEM_A-095-12-931-166,Diagnostics,Brooke,quantity,0,1,1,0,1,1,12,3,5,3,0,0,0,0
+A-832-24-420-166,D100,Medical,ITEM_A-832-24-420-166,Diagnostics,Brooke,quantity,1,1,0,0,1,1,12,3,2,3,0,0,0,0
+A-853-24-420-166,D100,Medical,ITEM_A-853-24-420-166,Diagnostics,Brooke,quantity,2,1,0,0,1,1,12,1,6,3,0,0,0,0
+A-879-24-420-166,D100,Medical,ITEM_A-879-24-420-166,Diagnostics,Brooke,quantity,0,0,1,0,0,0,12,0,0,0,0,0,0,0
+Casework,D100,Medical,Total Casework,Cabinetry,Kylie Gilbert,dollars,1,0,0,0,1,0,12,0,0,2,0,0,0,0
+ECG,D100,Medical,ITEM_4-000-0080,Diagnostics,Brooke,quantity,1,0,1,1,0,0,12,5,0,1,0,0,0,0
+M-000-09-230-166,D100,Medical,ITEM_M-000-09-230-166,Diagnostics,Brooke,quantity,2,0,1,0,0,0,12,2,6,5,0,0,0,0
+M-000-09-323-166,D100,Medical,ITEM_M-000-09-323-166,Diagnostics,Brooke,quantity,1,1,0,0,1,1,12,3,1,0,0,0,0,0
+M11-050,D100,Medical,ITEM_M11-040|ITEM_M11-050|ITEM_M11-042,Instrument Processing,Ben Hill,quantity,0,1,1,0,1,1,12,0,0,0,0,0,0,0
+M9-050,D100,Medical,ITEM_M9-040|ITEM_M9-050|ITEM_M9-042,Instrument Processing,Ben Hill,quantity,1,0,1,0,1,0,12,0,0,0,0,0,0,0
+M9D-042,D100,Medical,ITEM_M9D-042,Instrument Processing,Ben Hill,quantity,0,0,1,0,1,0,12,0,0,0,0,0,0,0
+Mobile Workstations,D100,Medical,prod_16895,Workstations,Kylie Gilbert,quantity,1,0,0,0,1,0,12,0,0,0,0,0,0,0
+Patient Support Rails,D100,Medical,ITEM_9A600001,Workstations,Kylie Gilbert,quantity,0,0,1,0,1,0,12,0,1,4,0,0,0,0
+Patient Support Rails Plus,D100,Medical,ITEM_9A600002,Workstations,Kylie Gilbert,quantity,0,1,1,0,0,0,12,2,1,5,0,0,0,0
+QC1,D100,Medical,Prod_3QC1,Workstations,Kylie Gilbert,quantity,1,1,1,0,0,0,12,5,2,5,0,0,0,0
+QC3,D100,Medical,Prod_3QC3,Workstations,Kylie Gilbert,quantity,0,0,1,0,0,0,12,4,6,4,0,0,0,0
+QC3R,D100,Medical,Prod_3QC3R,Workstations,Kylie Gilbert,quantity,0,0,1,0,0,0,12,5,5,5,0,0,0,0
+QC6,D100,Medical,prod_3QC6,Workstations,Kylie Gilbert,quantity,2,0,0,0,0,0,12,0,0,0,0,0,0,0
+QC6R,D100,Medical,prod_3QC6R,Workstations,Kylie Gilbert,quantity,0,0,1,0,0,0,12,1,0,1,0,0,0,0
+Wall Mounted Workstations,D100,Medical,prod_16875,Workstations,Kylie Gilbert,quantity,0,1,2,0,1,1,12,0,0,0,0,0,0,0
+255,D200,Dental,prod_255,Lights,Krista Beyke,quantity,0,0,1,0,1,0,12,4,4,5,0,0,0,0
+641,D200,Dental,Prod_641,Medical Tables,Krista Beyke,quantity,1,0,0,0,0,0,12,1,5,5,0,0,0,0
+153811,D200,Dental,Prod_18700,Seating,Krista Beyke,quantity,0,1,1,0,1,0,12,2,5,3,0,0,0,0
+21500,D200,Dental,Prod_21500,Accessory,,dollars,0,0,1,0,1,0,12,0,0,0,0,0,0,0
+153812,D200,Dental,Prod_18702,Seating,Krista Beyke,quantity,1,1,1,0,1,0,12,6,6,6,0,0,0,0
+153964,D200,Dental,ITEM_153964-011,Lights,Krista Beyke,quantity,1,0,0,0,0,0,12,6,1,0,0,0,0,0
+77000025,D200,Dental,ITEM_77000025,Accessory,,quantity,1,1,0,0,1,0,12,0,0,0,0,0,0,0
+77000026,D200,Dental,ITEM_77000026,Accessory,,quantity,0,1,1,0,0,0,12,0,0,0,0,0,0,0
+77000027,D200,Dental,ITEM_77000027,Accessory,,quantity,1,0,2,0,0,0,12,0,0,0,0,0,0,0
+77002146,D200,Dental,ITEM_77002146,Accessory,,quantity,0,0,1,0,0,0,12,0,0,0,0,0,0,0
+77002147,D200,Dental,ITEM_77002147,Accessory,,quantity,0,0,1,0,0,0,12,0,0,0,0,0,0,0
+002-1494-00,D200,Dental,ITEM_002-1494-00,Air/Vac,Mandy Schlater,quantity,0,1,1,0,1,0,12,0,0,0,0,0,0,0
+153592-001,D200,Dental,ITEM_153592-001,Seating,Krista Beyke,quantity,1,0,1,0,0,1,12,3,0,3,0,0,0,0
+153592-002,D200,Dental,ITEM_153592-002,Seating,Krista Beyke,quantity,1,0,0,0,0,0,12,0,0,6,0,0,0,0
+153592-003,D200,Dental,ITEM_153592-003,Seating,Krista Beyke,quantity,1,0,1,0,0,0,12,6,6,6,0,0,0,0
+153678-002,D200,Dental,ITEM_153678-002,Delivery Units,Krista Beyke,quantity,2,0,0,0,0,0,12,5,5,6,0,0,0,0
+153810-XXX,D200,Dental,ITEM_153810-XXX,Seating,Krista Beyke,quantity,0,1,1,0,1,1,12,2,2,6,0,0,0,0
+153839-013,D200,Dental,ITEM_153839-013,Delivery Units,Krista Beyke,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+153901-002,D200,Dental,ITEM_153901-002,Lights,Krista Beyke,quantity,1,0,2,1,0,0,12,0,4,0,0,0,0,0
+153901-003,D200,Dental,ITEM_153901-003,Lights,Krista Beyke,quantity,1,0,1,0,0,0,12,5,0,5,0,0,0,0
+153901-004,D200,Dental,ITEM_153901-004,Lights,Krista Beyke,quantity,0,0,1,0,0,0,12,5,0,2,0,0,0,0
+153901-005,D200,Dental,ITEM_153901-005,Lights,Krista Beyke,quantity,1,0,0,0,0,1,12,0,0,0,0,0,0,0
+153904-002,D200,Dental,ITEM_153904-002,Lights,Krista Beyke,quantity,1,0,2,0,0,0,12,0,0,0,0,0,0,0
+996_S,D200,Dental,Prod_996_S,Seating,Krista Beyke,quantity,1,0,0,0,0,0,12,3,3,4,0,0,0,0
+9A586001,D200,Dental,ITEM_9A586001,Accessory,,quantity,1,0,2,0,0,0,12,0,0,0,0,0,0,0
+9A586002,D200,Dental,ITEM_9A586002,Accessory,,quantity,1,0,0,0,0,0,12,0,0,0,0,0,0,0
+9A599001,D200,Dental,ITEM_9A599001,Accessory,,quantity,2,0,2,0,0,0,12,0,0,0,0,0,0,0
+9A682001,D200,Dental,ITEM_9A682001,Accessory,,quantity,2,0,2,0,0,0,12,0,0,0,0,0,0,0
+9A694001,D200,Dental,ITEM_9A694001,Accessory,,quantity,1,0,0,0,0,0,12,0,0,0,0,0,0,0
+9A694002,D200,Dental,ITEM_9A694002,Accessory,,quantity,1,0,0,0,0,0,12,0,0,0,0,0,0,0
+9A717001,D200,Dental,ITEM_9A717001,Accessory,,quantity,2,0,2,0,0,0,12,0,0,0,0,0,0,0
+9A721001,D200,Dental,ITEM_9A721001,Accessory,,quantity,0,1,0,0,1,0,12,0,0,0,0,0,0,0
+9A723001,D200,Dental,ITEM_9A723001,Accessory,,quantity,1,0,2,0,0,0,12,0,0,0,0,0,0,0
+9A724001,D200,Dental,ITEM_9A724001,Accessory,,quantity,1,0,0,0,0,0,12,0,0,0,0,0,0,0
+9A738001,D200,Dental,ITEM_9A738001,Accessory,,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+9A738003,D200,Dental,ITEM_9A738003,Accessory,,quantity,1,0,1,0,0,0,12,0,0,0,0,0,0,0
+ADS-1100-001,D200,Dental,ITEM_ADS-1100-001,Delivery Units,Krista Beyke,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ADS-1200-001,D200,Dental,ITEM_ADS-1200-001,Delivery Units,Krista Beyke,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+Asepsis 21 - Rear Delivery,D200,Dental,ITEM_153720-001|ITEM_153720-011,Delivery Units,Krista Beyke,quantity,1,0,0,0,0,1,12,0,0,0,0,0,0,0
+Asepsis 21 - Traditional,D200,Dental,ITEM_153600-008,Delivery Units,Krista Beyke,quantity,0,1,1,0,1,1,12,0,0,1,0,0,0,0
+Asepsis 21 Dr Cart,D200,Dental,ITEM_153740-002|ITEM_153740-012,Delivery Units,Krista Beyke,quantity,0,0,1,0,0,1,12,6,4,6,0,0,0,0
+Asepsis 21 Hygienist's Cart,D200,Dental,ITEM_153740-004|ITEM_153740-014,Delivery Units,Krista Beyke,quantity,1,0,0,0,0,0,12,0,0,0,0,0,0,0
+Asepsis 21 LR Duo Cart,D200,Dental,ITEM_153740-003|ITEM_153740-013,Delivery Units,Krista Beyke,quantity,1,0,0,1,0,0,12,0,0,2,0,0,0,0
+Cabinet Mounted LED Light,D200,Dental,PROD_LT-1200|ITEM_cbml-l,Lights,Krista Beyke,quantity,0,0,0,0,0,0,0,0,5,5,0,0,0,0
+Artisan Casework,D200,Dental,Midmark/Ritter Casework,Cabinetry,Mandy Schlater,dollars,1,0,1,0,1,0,12,0,0,4,0,1,2,0
+Synthesis Casework,D200,Dental,Synthesis Casework,Cabinetry,Mandy Schlater,dollars,1,0,1,0,1,0,12,0,0,4,0,1,2,0
+Ceiling Mounted LED Light,D200,Dental,PROD_LT-1400|ITEM_ceml-l,Lights,Krista Beyke,quantity,1,1,1,0,1,0,12,4,2,4,0,0,0,0
+CH-1000-001,D200,Dental,ITEM_CH-1000-001,Seating,Krista Beyke,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+Chair Mounted LED Light,D200,Dental,PROD_LT-1100|ITEM_153915-002,Lights,Krista Beyke,quantity,0,0,1,0,1,0,12,1,0,4,0,0,0,0
+CV10,D200,Dental,ITEM_CV10,Air/Vac,Mandy Schlater,quantity,1,0,1,0,0,0,12,0,0,0,0,0,0,0
+CV10R,D200,Dental,ITEM_CV10R,Air/Vac,Mandy Schlater,quantity,1,0,0,0,0,1,12,6,5,6,0,0,0,0
+CV3,D200,Dental,ITEM_CV3,Air/Vac,Mandy Schlater,quantity,1,0,0,0,0,0,12,0,0,0,0,0,0,0
+CV3R,D200,Dental,ITEM_CV3R,Air/Vac,Mandy Schlater,quantity,0,0,1,1,0,0,12,5,5,0,0,0,0,0
+CV5,D200,Dental,ITEM_CV5,Air/Vac,Mandy Schlater,quantity,1,0,0,0,0,1,12,0,0,0,0,0,0,0
+CV5R,D200,Dental,ITEM_CV5R,Air/Vac,Mandy Schlater,quantity,1,0,0,0,0,0,12,0,0,2,0,0,0,0
+CV6,D200,Dental,ITEM_CV6,Air/Vac,Mandy Schlater,quantity,1,0,1,0,0,0,12,0,0,0,0,0,0,0
+CV6R,D200,Dental,ITEM_CV6R,Air/Vac,Mandy Schlater,quantity,1,0,0,0,0,0,12,0,1,2,0,0,0,0
+DS-1100-001,D200,Dental,ITEM_DS-1100-001,Delivery Units,Krista Beyke,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+DS-1200-001,D200,Dental,ITEM_DS-1200-001,Delivery Units,Krista Beyke,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+G10,D200,Dental,ITEM_G10|ITEM_G10-050,Air/Vac,Mandy Schlater,quantity,1,0,1,0,0,0,12,6,0,6,0,0,0,0
+G14,D200,Dental,ITEM_G14|ITEM_G14-050,Air/Vac,Mandy Schlater,quantity,0,0,1,0,0,0,12,0,0,0,0,0,0,0
+G3,D200,Dental,ITEM_G3|ITEM_G3-050,Air/Vac,Mandy Schlater,quantity,1,0,0,1,0,0,12,0,2,0,0,0,0,0
+G5,D200,Dental,ITEM_G5|ITEM_G5-050,Air/Vac,Mandy Schlater,quantity,1,0,0,0,0,1,12,3,6,6,0,0,0,0
+G6,D200,Dental,ITEM_G6|ITEM_G6-050,Air/Vac,Mandy Schlater,quantity,2,0,0,0,0,0,12,0,0,0,0,0,0,0
+G7,D200,Dental,ITEM_G7|ITEM_G7-050,Air/Vac,Mandy Schlater,quantity,0,0,1,1,0,0,12,1,1,3,0,0,0,0
+LR Asst Rear Chair Mount,D200,Dental,ITEM_153600-009,Delivery Units,Krista Beyke,quantity,0,0,1,0,0,0,12,0,0,1,0,0,0,0
+LT-1500,D200,Dental,PROD_LT-1500,Lights,Krista Beyke,quantity,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+M11-050,D200,Dental,ITEM_M11-040|ITEM_M11-050,Instrument Processing,Sarah Seaton,quantity,1,0,0,0,1,0,12,0,0,0,0,0,0,0
+M9-050,D200,Dental,ITEM_M9-040|ITEM_M9-050,Instrument Processing,Sarah Seaton,quantity,0,0,1,1,0,0,12,0,0,0,0,0,0,0
+Mobile Workstations,D200,Dental,prod_16895,Workstations,Mandy Schlater,quantity,1,0,0,1,0,0,12,0,0,0,0,0,0,0
+P10,D200,Dental,ITEM_P10,Air/Vac,Mandy Schlater,quantity,0,0,2,0,0,0,12,0,0,0,0,0,0,0
+P14,D200,Dental,ITEM_P14,Air/Vac,Mandy Schlater,quantity,1,0,1,1,0,0,12,5,6,5,0,0,0,0
+P21,D200,Dental,ITEM_P21|ITEM_P21-050,Air/Vac,Mandy Schlater,quantity,1,0,1,0,0,0,12,0,0,1,0,0,0,0
+P22,D200,Dental,ITEM_P22|ITEM_P22-050,Air/Vac,Mandy Schlater,quantity,0,1,1,1,0,0,12,2,4,5,0,0,0,0
+P3,D200,Dental,ITEM_P3,Air/Vac,Mandy Schlater,quantity,1,0,1,0,0,1,12,0,0,0,0,0,0,0
+P32,D200,Dental,ITEM_P32|ITEM_P32-050,Air/Vac,Mandy Schlater,quantity,0,0,1,0,1,0,12,2,2,2,0,0,0,0
+P5,D200,Dental,ITEM_P5,Air/Vac,Mandy Schlater,quantity,1,0,2,0,0,0,12,1,5,3,0,0,0,0
+P52,D200,Dental,ITEM_P52|ITEM_P52-050,Air/Vac,Mandy Schlater,quantity,0,0,1,0,1,0,12,0,0,3,0,0,0,0
+P6,D200,Dental,ITEM_P6,Air/Vac,Mandy Schlater,quantity,0,0,1,1,0,0,12,0,0,0,0,0,0,0
+P7,D200,Dental,ITEM_P7,Air/Vac,Mandy Schlater,quantity,2,0,1,0,0,0,12,3,0,6,0,0,0,0
+P72,D200,Dental,ITEM_P72|ITEM_P72-050,Air/Vac,Mandy Schlater,quantity,1,0,1,0,0,0,12,3,4,0,0,0,0,0
+PM-1,D200,Dental,ITEM_PM-1,Air/Vac,Mandy Schlater,quantity,2,0,0,0,0,0,12,4,6,4,0,0,0,0
+PM-3,D200,Dental,ITEM_PM-3,Air/Vac,Mandy Schlater,quantity,2,0,2,0,0,1,12,6,6,5,0,0,0,0
+PM-4,D200,Dental,ITEM_PM-4,Air/Vac,Mandy Schlater,quantity,2,0,2,0,0,0,12,0,1,0,0,0,0,0
+Preva,D200,Dental,Prod_21200,Air/Vac,Mandy Schlater,quantity,0,1,1,2,1,0,12,6,2,5,0,0,0,0
+Preva Plus,D200,Dental,Prod_21300,Air/Vac,Mandy Schlater,quantity,1,0,0,1,0,0,12,0,0,0,0,0,0,0
+Preva Sensor,D200,Dental,prod_21010|Prod_21000,Air/Vac,Mandy Schlater,quantity,1,0,1,0,0,0,12,3,6,2,0,0,0,0
+Procenter,D200,Dental,ITEM_153600-007,Air/Vac,Mandy Schlater,quantity,1,0,0,0,1,0,12,0,5,6,0,0,0,0
+QC1,D200,Dental,Prod_3QC1,Instrument Processing,Sarah Seaton,quantity,0,0,1,0,0,0,12,1,3,2,0,0,0,0
+QC3,D200,Dental,Prod_3QC3,Instrument Processing,Sarah Seaton,quantity,0,1,1,0,1,0,12,4,4,5,0,0,0,0
+QC3R,D200,Dental,Prod_3QC3R,Instrument Processing,Sarah Seaton,quantity,0,0,1,0,0,0,12,1,1,2,0,0,0,0
+QC6,D200,Dental,prod_3QC6,Instrument Processing,Sarah Seaton,quantity,1,1,0,0,1,0,12,0,2,0,0,0,0,0
+QC6R,D200,Dental,prod_3QC6R,Instrument Processing,Sarah Seaton,quantity,0,0,1,0,0,1,12,4,0,2,0,0,0,0
+Track Mounted LED,D200,Dental,PROD_LT-1600|ITEM_trml-l,Air/Vac,Mandy Schlater,quantity,0,1,1,0,1,0,12,5,5,5,0,0,0,0
+ULTRACHAIR-XXX,D200,Dental,ITEM_ULTRACHAIR-XXX,Air/Vac,Mandy Schlater,quantity,0,1,1,0,1,1,12,0,0,0,0,0,0,0
+Wall Mounted LED Light,D200,Dental,PROD_LT-1300|ITEM_waml-l,Air/Vac,Mandy Schlater,quantity,0,1,1,0,1,0,12,3,4,1,0,0,0,0
+Wall Mounted Workstations,D200,Dental,prod_16875,Workstations,Mandy Schlater,quantity,2,1,0,0,1,0,12,0,0,0,0,0,0,0
+Work Surface,D200,Dental,ITEM_153659-003,Delivery Units,Krista Beyke,quantity,0,1,1,0,1,0,12,0,0,0,0,0,0,0
+Work Surface and Asst,D200,Dental,ITEM_153659-004,Delivery Units,Krista Beyke,quantity,0,0,1,0,1,0,12,0,1,2,0,0,0,0
+"Work Surface, Asst, and Procenter",D200,Dental,ITEM_153659-002,Delivery Units,Krista Beyke,quantity,0,1,1,0,1,0,12,0,2,2,0,0,0,0
+250,D300,Animal Health,PROD_50,Lights,John Freytag,quantity,1,0,0,0,0,0,12,0,6,0,0,0,0,0
+255,D300,Animal Health,prod_255,Lights,John Freytag,quantity,0,0,2,1,0,1,12,3,1,6,0,0,0,0
+5926,D300,Animal Health,Prod_5926,Monitoring & Critical Care,Sami Michaelis,quantity,1,1,0,0,0,0,12,0,1,5,0,0,0,0
+5927,D300,Animal Health,Prod_5927,Monitoring & Critical Care,Sami Michaelis,quantity,0,1,1,0,1,1,12,1,0,1,0,0,0,0
+5930,D300,Animal Health,Prod_5930,Monitoring & Critical Care,Sami Michaelis,quantity,0,1,1,0,1,1,12,5,6,6,0,0,0,0
+5980,D300,Animal Health,prod_5980,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,1,1,1,0,1,0,12,3,3,0,0,0,0,0
+7225,D300,Animal Health,prod_7225,"Tables, Tubs, & Sinks",Steph Bertschy,dollars,0,1,0,0,1,1,12,0,0,0,0,0,0,0
+7230,D300,Animal Health,Prod_7230,Scales,Jose Valdez,quantity,0,1,0,0,1,0,12,3,2,3,0,0,0,0
+7281,D300,Animal Health,prod_7281,"Parts, Service & Repair",,dollars,1,1,0,0,1,1,12,0,0,0,0,0,0,0
+7291,D300,Animal Health,prod_7291,"Parts, Service & Repair",,dollars,0,1,0,0,1,0,12,0,0,0,0,0,0,0
+7293,D300,Animal Health,prod_7293,Accessory,,dollars,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+7299,D300,Animal Health,Prod_7299,Accessory,,dollars,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+7300,D300,Animal Health,prod_7300,Accessory,,dollars,0,1,0,0,1,1,12,0,0,0,0,0,0,0
+153811,D300,Animal Health,Prod_18700,Seating,John Freytag,quantity,0,0,1,1,0,1,12,0,0,0,0,0,0,0
+22010,D300,Animal Health,prod_22010,Imaging,Danielle Filbrun,quantity,2,1,0,0,1,1,12,0,0,0,0,0,0,0
+153812,D300,Animal Health,Prod_18702,Seating,John Freytag,quantity,0,0,1,0,0,0,12,0,0,0,0,0,0,0
+002-1895-00,D300,Animal Health,ITEM_002-1895-00,Monitoring & Critical Care,Sami Michaelis,quantity,0,0,1,0,0,0,12,3,2,3,0,0,0,0
+002-1896-00,D300,Animal Health,ITEM_002-1896-00,Monitoring & Critical Care,Sami Michaelis,quantity,0,1,1,0,1,1,12,3,4,3,0,0,0,0
+120/130 Lights,D300,Animal Health,Prod_7228,Lights,John Freytag,quantity,1,0,1,0,0,0,12,3,4,0,0,0,0,0
+996_A,D300,Animal Health,Prod_996_A,Seating,John Freytag,quantity,0,1,1,0,1,0,12,6,5,6,0,0,0,0
+996_M,D300,Animal Health,Prod_996_M,Seating,John Freytag,quantity,1,0,0,0,0,1,12,6,6,3,0,0,0,0
+996_S,D300,Animal Health,Prod_996_S,Seating,John Freytag,quantity,0,1,2,0,1,1,12,3,5,4,0,0,0,0
+996-V,D300,Animal Health,Prod_996-V,Seating,John Freytag,quantity,0,0,1,0,0,0,12,5,6,3,0,0,0,0
+AH9000-001,D300,Animal Health,ITEM_AH9000-001,Delivery Units,Danielle Filbrun,quantity,0,1,2,0,1,1,12,5,5,3,0,0,0,0
+AH9000-002,D300,Animal Health,ITEM_AH9000-002,Delivery Units,Danielle Filbrun,quantity,1,0,1,0,0,1,12,1,6,6,0,0,0,0
+AH9000-003,D300,Animal Health,ITEM_AH9000-003,Delivery Units,Danielle Filbrun,quantity,1,0,2,0,0,1,12,3,5,6,0,0,0,0
+AH9000-004,D300,Animal Health,ITEM_AH9000-004,Delivery Units,Danielle Filbrun,quantity,0,0,0,0,0,0,0,0,2,0,0,0,0,0
+AH9000-005,D300,Animal Health,ITEM_AH9000-005,Delivery Units,Danielle Filbrun,quantity,1,0,2,0,0,0,12,0,5,0,0,0,0,0
+BR Sensor,D300,Animal Health,Prod_22000,Imaging,Danielle Filbrun,quantity,2,1,0,0,1,0,12,6,4,6,0,0,0,0
+Casework,D300,Animal Health,Total Casework,Cabinetry,Steph Bertschy,dollars,0,0,1,0,1,0,12,0,0,0,0,0,6,0
+Cat Scales,D300,Animal Health,prod_7223,Scales,Jose Valdez,quantity,0,1,0,0,1,0,12,4,4,4,0,0,0,0
+Cat Towers,D300,Animal Health,Prod_7307,Containment,Jose Valdez,dollars,0,0,0,0,0,0,0,0,0,1,0,0,0,0
+Chain Link,D300,Animal Health,Prod_7322,Containment,Jose Valdez,dollars,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+CHRG-SVC371,D300,Animal Health,ITEM_CHRG-SVC371,"Parts, Service & Repair",,quantity,1,0,0,0,0,0,12,0,6,0,0,0,0,0
+Classic Grooming Tub,D300,Animal Health,prod_7325,Grooming,Jose Valdez,dollars,2,0,0,0,0,0,12,0,0,1,0,3,1,0
+CMDT-45,D300,Animal Health,ITEM_CMDT-45,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,0,0,1,0,0,1,12,4,6,6,0,0,0,0
+CMDT-60,D300,Animal Health,ITEM_CMDT-60,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,0,0,2,1,0,0,12,5,4,5,0,0,0,0
+CMDT-WS-45,D300,Animal Health,ITEM_CMDT-WS-45,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,1,0,1,0,0,0,12,6,2,6,0,0,0,0
+CMDT-WS-60,D300,Animal Health,ITEM_CMDT-WS-60,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,1,0,0,0,0,0,12,5,5,5,0,0,0,0
+CMWO,D300,Animal Health,ITEM_CMWO,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,1,0,0,0,0,0,12,1,6,0,0,0,0,0
+CMWS,D300,Animal Health,ITEM_CMWS,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,0,1,2,0,1,1,12,4,1,2,0,0,0,0
+Comfort Suites,D300,Animal Health,prod_7304|prod_7305|prod_7306,Containment,Jose Valdez,dollars,0,0,2,0,0,1,12,0,0,5,0,4,1,0
+C-STAT5,D300,Animal Health,ITEM_C-STAT5,Monitoring & Critical Care,Sami Michaelis,quantity,1,1,1,0,1,1,12,1,1,1,0,0,0,0
+DC Generator,D300,Animal Health,Prod_22200,Imaging,Danielle Filbrun,quantity,1,0,1,0,0,0,12,0,1,6,0,0,0,0
+Double Deckers,D300,Animal Health,Prod_7319,Containment,Jose Valdez,dollars,0,0,0,0,0,0,0,0,0,1,0,0,0,0
+DR Sensor,D300,Animal Health,prod_22011,Imaging,Danielle Filbrun,quantity,1,0,1,0,0,0,12,4,4,4,0,0,0,0
+Dryer Cages,D300,Animal Health,prod_7302,Containment,Jose Valdez,dollars,0,0,1,0,0,0,12,0,0,1,0,5,1,0
+Elite,D300,Animal Health,prod_7237,Grooming,Jose Valdez,dollars,0,1,0,0,1,0,12,0,0,4,0,4,4,0
+Elite Grooming Shower,D300,Animal Health,prod_7323,Grooming,Jose Valdez,dollars,0,0,2,0,0,0,12,0,0,5,0,1,3,0
+Elite Grooming Tub,D300,Animal Health,prod_7324,Grooming,Jose Valdez,dollars,2,0,0,0,0,0,12,0,0,1,0,2,3,0
+Flat Top Surgery Table,D300,Animal Health,Prod_7335,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,1,0,1,0,0,0,12,6,5,5,0,0,0,0
+Folding Kennels,D300,Animal Health,Prod_7314,Containment,Jose Valdez,dollars,0,0,0,0,0,0,0,0,0,2,0,0,0,0
+Fold-Up,D300,Animal Health,Prod_7234,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,0,1,0,0,1,1,12,2,2,2,0,0,0,0
+Isolation Cages,D300,Animal Health,Prod_7320,Containment,Jose Valdez,dollars,0,0,0,0,0,0,0,0,0,6,0,0,0,0
+K9 Cabins,D300,Animal Health,Prod_7318,Containment,Jose Valdez,dollars,0,0,0,0,0,0,0,0,0,5,0,0,0,0
+LOFLO,D300,Animal Health,ITEM_LOFLO,Monitoring & Critical Care,Sami Michaelis,quantity,0,1,2,0,1,1,12,5,5,0,0,0,0,0
+Luxury Suites,D300,Animal Health,Prod_7321,Grooming,Jose Valdez,dollars,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+M11-053,D300,Animal Health,ITEM_M11-043|ITEM_M11-053,Instrument Processing,Sami Michaelis,quantity,1,0,0,0,1,0,12,3,0,1,0,0,0,0
+M9-053,D300,Animal Health,ITEM_M9-043|ITEM_M9-053,Instrument Processing,Sami Michaelis,quantity,1,0,0,0,0,0,12,4,2,0,0,0,0,0
+Midmark Complete,D300,Animal Health,Prod_22100,Imaging,Danielle Filbrun,quantity,0,0,1,0,1,0,12,0,0,0,0,0,0,0
+Mobile Lift Tables,D300,Animal Health,Prod_7334,"Tables, Tubs, & Sinks",Steph Bertschy,dollars,1,1,0,0,1,1,12,0,0,1,0,4,1,0
+Mobile Room Dividers,D300,Animal Health,Prod_7308,Containment,Jose Valdez,dollars,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+Mobile Workstations,D300,Animal Health,prod_16895,Workstations,Steph Bertschy,quantity,0,0,1,0,0,1,12,0,0,0,0,0,0,0
+QC1,D300,Animal Health,Prod_3QC1,Instrument Processing,Sami Michaelis,quantity,1,0,1,1,0,0,12,0,1,0,0,0,0,0
+QC3,D300,Animal Health,Prod_3QC3,Instrument Processing,Sami Michaelis,quantity,0,0,1,0,0,1,12,4,4,4,0,0,0,0
+QC3R,D300,Animal Health,Prod_3QC3R,Instrument Processing,Sami Michaelis,quantity,0,0,1,0,0,0,12,2,5,3,0,0,0,0
+QC6,D300,Animal Health,prod_3QC6,Instrument Processing,Sami Michaelis,quantity,0,0,1,0,0,0,12,3,4,3,0,0,0,0
+QC6R,D300,Animal Health,prod_3QC6R,Instrument Processing,Sami Michaelis,quantity,1,0,1,0,0,0,12,0,3,0,0,0,0,0
+Quiet Cottages,D300,Animal Health,Prod_7301,Containment,Jose Valdez,dollars,0,0,0,0,0,0,0,0,0,3,0,0,0,0
+Raintree,D300,Animal Health,prod_7243,Containment,Jose Valdez,dollars,0,1,1,0,1,1,12,0,0,0,0,6,3,0
+Sani-Kennels,D300,Animal Health,prod_7312|prod_7313,Containment,Jose Valdez,dollars,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+Scavengers,D300,Animal Health,Prod_5726,Monitoring & Critical Care,Sami Michaelis,quantity,1,1,1,0,0,0,12,4,1,6,0,0,0,0
+Shor-Pet,D300,Animal Health,Prod_7251,"Tables, Tubs, & Sinks",Steph Bertschy,dollars,2,1,1,0,1,0,12,0,0,0,0,0,0,0
+Small Animal Bathing Tub,D300,Animal Health,prod_7326,Grooming,Jose Valdez,dollars,2,0,1,0,0,0,12,0,0,0,0,0,0,0
+Sodasorb,D300,Animal Health,prod_5797,Monitoring & Critical Care,Sami Michaelis,quantity,1,0,1,0,1,0,12,6,0,0,0,0,0,0
+SS Treatment Tubs,D300,Animal Health,Prod_7233,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,0,1,0,0,0,0,12,0,0,0,0,0,0,0
+Stainless Steel Cages,D300,Animal Health,prod_7220|prod_7332,Containment,Jose Valdez,dollars,0,1,0,0,1,1,12,0,0,1,0,1,0,0
+Stainless Steel Cat Suites,D300,Animal Health,prod_7303,Containment,Jose Valdez,dollars,0,1,1,0,1,0,12,0,0,0,0,0,0,0
+Stainless Steel Fixed Height Tables,D300,Animal Health,Prod_7231,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,0,0,0,0,0,0,0,1,1,1,0,0,0,0
+Stainless Steel Kennels,D300,Animal Health,prod_7309|prod_7310,Containment,Jose Valdez,dollars,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+Stationary Fold-Up Lift Table,D300,Animal Health,Prod_7333,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,0,0,0,0,0,0,0,6,6,6,0,0,0,0
+Synthesis Fixed Height Tables,D300,Animal Health,Prod_5860,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,0,0,1,0,1,0,12,0,6,0,0,0,0,0
+Tapered Electric,D300,Animal Health,Prod_7337,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,1,0,0,0,0,0,12,6,5,1,0,0,0,0
+T-Kennels,D300,Animal Health,prod_7315|prod_7316,Containment,Jose Valdez,dollars,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+Ultra-Base,D300,Animal Health,Prod_7311,Containment,Jose Valdez,dollars,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+UltraLift Pro,D300,Animal Health,prod_7250,"Tables, Tubs, & Sinks",Steph Bertschy,dollars,0,0,0,0,0,0,0,0,0,6,0,0,0,0
+Utility Tables,D300,Animal Health,Prod_7329,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,0,1,0,0,1,1,12,2,0,6,0,0,0,0
+Vaporizers,D300,Animal Health,Prod_5740,Monitoring & Critical Care,Sami Michaelis,quantity,1,1,1,1,1,1,12,2,2,1,0,0,0,0
+Ventilators,D300,Animal Health,Prod_5750,Monitoring & Critical Care,Sami Michaelis,quantity,0,0,1,0,0,1,12,0,2,0,0,0,0,0
+VME2,D300,Animal Health,Prod_5722,Monitoring & Critical Care,Sami Michaelis,quantity,0,0,1,0,0,0,12,3,3,2,0,0,0,0
+VMR,D300,Animal Health,Prod_5725,Monitoring & Critical Care,Sami Michaelis,quantity,1,0,0,0,0,0,12,4,4,4,0,0,0,0
+VMS,D300,Animal Health,Prod_5720,Monitoring & Critical Care,Sami Michaelis,quantity,0,1,2,0,1,1,12,3,4,6,0,0,0,0
+VMS Plus,D300,Animal Health,Prod_5721,Monitoring & Critical Care,Sami Michaelis,quantity,0,1,1,0,1,0,12,0,6,1,0,0,0,0
+V-Top Surgery Table,D300,Animal Health,Prod_7336,"Tables, Tubs, & Sinks",Steph Bertschy,quantity,0,0,0,0,0,0,0,6,6,6,0,0,0,0
+Wall Mounted Workstations,D300,Animal Health,prod_16875,Workstations,Steph Bertschy,quantity,0,0,1,0,0,0,12,0,0,0,0,0,0,0
