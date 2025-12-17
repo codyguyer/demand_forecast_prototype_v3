@@ -45,6 +45,6 @@ python sarima_forecast.py
    - Outputs `stats_model_forecasts_YYYY-Mon.xlsx`
 
 ## Notes
-- Exogenous candidates include lagged Salesforce signals (`New_Quotes`, `Open_Opportunities`) and `Bookings`; lag logic lives in each script.
+- Exogenous candidates include lagged Salesforce signals (`New_Opportunities`, `Open_Opportunities`) and `Bookings`; lag logic lives in each script.
 - Rolling-origin CV and holdout windows are configured at the top of the scripts; adjust there for different horizons or minimum history.
 - Data files are ignored by Git; share them separately if collaborators need to reproduce runs.

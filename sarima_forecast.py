@@ -3,8 +3,9 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import ast
+import os
 import uuid
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -19,6 +20,7 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 INPUT_FILE = "all_products_with_sf_and_bookings.xlsx"
 SUMMARY_FILE = "sarima_multi_sku_summary.xlsx"          # chosen model per SKU
 ORDER_FILE = "sarimax_order_search_summary.xlsx"        # chosen (p,d,q)(P,D,Q,s) per SKU
+NOTES_FILE = "Notes.xlsx"                               # manual order overrides
 OUTPUT_FILE_BASE = "stats_model_forecasts.xlsx"
 # If a chosen regressor has lag 0, we fall back to baseline (no exog).
 # If future exogenous values are missing, we do NOT fill; the SKU will fall back to baseline instead.
@@ -28,11 +30,12 @@ COL_PRODUCT = "Product"
 COL_DIVISION = "Division"
 COL_DATE = "Month"
 COL_ACTUALS = "Actuals"
-COL_NEW_QUOTES = "New_Quotes"
+COL_NEW_OPPORTUNITIES = "New_Opportunities"
 COL_OPEN_OPPS = "Open_Opportunities"
 COL_BOOKINGS = "Bookings"
 
 FORECAST_HORIZON = 12
+FORECAST_FLOOR = 0.0
 
 # Labels for outward-facing model descriptions
 MODEL_LABELS = {
@@ -59,12 +62,46 @@ def _build_output_filename(base_name: str, first_forecast_dt: Optional[pd.Timest
 # HELPERS
 # ===========================
 
+def aggregate_monthly_duplicates(
+    df: pd.DataFrame,
+    product_col: str = COL_PRODUCT,
+    division_col: str = COL_DIVISION,
+    date_col: str = COL_DATE,
+    sum_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Collapse duplicate Product/Division/Month rows by summing key numeric fields.
+    Preserves any extra columns by taking the first value within each group.
+    """
+    df = df.copy()
+    if date_col in df.columns:
+        df[date_col] = pd.to_datetime(df[date_col])
+
+    # Only sum true additive series; keep others (e.g., opportunities) as first.
+    sum_cols = sum_cols or [COL_ACTUALS, COL_BOOKINGS]
+    present_sum_cols = [c for c in sum_cols if c in df.columns]
+
+    group_cols = [c for c in [product_col, division_col, date_col] if c in df.columns]
+    agg_dict = {col: "sum" for col in present_sum_cols}
+    for col in df.columns:
+        if col in group_cols or col in agg_dict:
+            continue
+        agg_dict[col] = "first"
+
+    aggregated = (
+        df.groupby(group_cols, dropna=False, as_index=False)
+        .agg(agg_dict)
+        .sort_values(group_cols)
+    )
+    return aggregated
+
+
 def _friendly_regressor_name(reg_name: Optional[str]) -> str:
     """Return a natural-language regressor name."""
     if reg_name is None:
         return "Regressor"
     mapping = {
-        "New_Quotes": "Salesforce",
+        "New_Opportunities": "Salesforce",
         "Open_Opportunities": "Salesforce",
         "Bookings": "Bookings",
     }
@@ -119,7 +156,41 @@ def _parse_order_cell(value, expected_len: int) -> Optional[Tuple[int, ...]]:
         return None
 
 
-def load_orders_map(path: str) -> Dict[Tuple[str, str], Tuple[Tuple[int, ...], Tuple[int, ...]]]:
+def _load_manual_order_overrides(path: str) -> Dict[Tuple[str, str], Tuple[Tuple[int, ...], Tuple[int, ...]]]:
+    """Load manual SARIMA order overrides from Notes.xlsx if present."""
+    if path is None or not os.path.exists(path):
+        return {}
+    try:
+        df_notes = pd.read_excel(path)
+    except Exception as exc:
+        print(f"Could not read manual overrides from {path}: {exc}")
+        return {}
+
+    product_col = COL_PRODUCT if COL_PRODUCT in df_notes.columns else None
+    division_col = COL_DIVISION if COL_DIVISION in df_notes.columns else None
+    if product_col is None and "group_key" in df_notes.columns:
+        product_col = "group_key"
+    if division_col is None and "BU" in df_notes.columns:
+        division_col = "BU"
+
+    required_cols = {product_col, division_col, "Chosen_Order", "Chosen_Seasonal_Order"}
+    if None in required_cols or not required_cols.issubset(df_notes.columns):
+        print(f"Manual overrides file {path} is missing required columns; skipping.")
+        return {}
+
+    overrides: Dict[Tuple[str, str], Tuple[Tuple[int, ...], Tuple[int, ...]]] = {}
+    for _, row in df_notes.iterrows():
+        order = _parse_order_cell(row["Chosen_Order"], 3)
+        seas_order = _parse_order_cell(row["Chosen_Seasonal_Order"], 4)
+        if order is None or seas_order is None:
+            continue
+        prod = row[product_col]
+        div = row[division_col]
+        overrides[(prod, div)] = (order, seas_order)
+    return overrides
+
+
+def load_orders_map(path: str, overrides_path: Optional[str] = None) -> Dict[Tuple[str, str], Tuple[Tuple[int, ...], Tuple[int, ...]]]:
     """Load per-SKU SARIMA orders from Excel."""
     df_orders = pd.read_excel(path)
     required_cols = {COL_PRODUCT, COL_DIVISION, "Chosen_Order", "Chosen_Seasonal_Order"}
@@ -136,6 +207,11 @@ def load_orders_map(path: str) -> Dict[Tuple[str, str], Tuple[Tuple[int, ...], T
         if order is None or seas_order is None:
             continue
         orders_map[(prod, div)] = (order, seas_order)
+
+    overrides = _load_manual_order_overrides(overrides_path or NOTES_FILE)
+    if overrides:
+        orders_map.update(overrides)
+        print(f"Applied {len(overrides)} manual order override(s) from {overrides_path or NOTES_FILE}.")
     return orders_map
 
 
@@ -157,8 +233,8 @@ def load_model_choices(path: str) -> Dict[Tuple[str, str], dict]:
         model_name = model_name.strip()
         if model_name == "SARIMA_baseline":
             return None, None
-        if "New_Quotes" in model_name:
-            return "New_Quotes", 1
+        if "New_Opportunities" in model_name:
+            return "New_Opportunities", 1
         if "Open_Opportunities" in model_name:
             return "Open_Opportunities", 0
         if "Bookings" in model_name and "_l1" in model_name:
@@ -230,14 +306,14 @@ def load_model_choices(path: str) -> Dict[Tuple[str, str], dict]:
 def engineer_regressors(df_sku: pd.DataFrame) -> pd.DataFrame:
     """Create lagged regressor features used by SARIMAX candidates."""
     df = df_sku.copy()
-    for col in [COL_NEW_QUOTES, COL_OPEN_OPPS, COL_BOOKINGS]:
+    for col in [COL_NEW_OPPORTUNITIES, COL_OPEN_OPPS, COL_BOOKINGS]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    if COL_NEW_QUOTES in df.columns:
-        df["New_Quotes_l1"] = df[COL_NEW_QUOTES].shift(1)
-        df["New_Quotes_l2"] = df[COL_NEW_QUOTES].shift(2)
-        df["New_Quotes_l3"] = df[COL_NEW_QUOTES].shift(3)
+    if COL_NEW_OPPORTUNITIES in df.columns:
+        df["New_Opportunities_l1"] = df[COL_NEW_OPPORTUNITIES].shift(1)
+        df["New_Opportunities_l2"] = df[COL_NEW_OPPORTUNITIES].shift(2)
+        df["New_Opportunities_l3"] = df[COL_NEW_OPPORTUNITIES].shift(3)
     if COL_OPEN_OPPS in df.columns:
         df["Open_Opportunities_l0"] = df[COL_OPEN_OPPS]
         df["Open_Opportunities_l1"] = df[COL_OPEN_OPPS].shift(1)
@@ -256,9 +332,9 @@ def get_exog_series(df: pd.DataFrame, reg_name: Optional[str], reg_lag: Optional
         return None
 
     col_map = {
-        ("New_Quotes", 1): "New_Quotes_l1",
-        ("New_Quotes", 2): "New_Quotes_l2",
-        ("New_Quotes", 3): "New_Quotes_l3",
+        ("New_Opportunities", 1): "New_Opportunities_l1",
+        ("New_Opportunities", 2): "New_Opportunities_l2",
+        ("New_Opportunities", 3): "New_Opportunities_l3",
         ("Open_Opportunities", 0): "Open_Opportunities_l0",
         ("Open_Opportunities", 1): "Open_Opportunities_l1",
         ("Open_Opportunities", 2): "Open_Opportunities_l2",
@@ -381,7 +457,7 @@ def generate_forecast_variants(
             "regressor_names": None,
             "regressor_details": None,
         })
-        dfs.append(sarima_df)
+        dfs.append(_apply_forecast_floor(sarima_df))
     except Exception as exc:
         print(f"  Failed SARIMA baseline: {exc}")
 
@@ -409,11 +485,11 @@ def generate_forecast_variants(
                 "P": 0,
                 "D": 0,
                 "Q": 0,
-                "s": 0,
-                "regressor_names": None,
-                "regressor_details": None,
-            })
-            dfs.append(arima_df)
+            "s": 0,
+            "regressor_names": None,
+            "regressor_details": None,
+        })
+            dfs.append(_apply_forecast_floor(arima_df))
         except Exception as exc:
             print(f"  Failed ARIMA baseline: {exc}")
 
@@ -454,7 +530,7 @@ def generate_forecast_variants(
                     "regressor_names": [regressor_name_str] * len(mean),
                     "regressor_details": None,
                 })
-                dfs.append(sarimax_df)
+                dfs.append(_apply_forecast_floor(sarimax_df))
             except Exception as exc:
                 print(f"  Failed regressor variant: {exc}")
 
@@ -475,12 +551,27 @@ def generate_forecast_variants(
 
 
 # ===========================
+# POST-PROCESSING
+# ===========================
+
+def _apply_forecast_floor(df: pd.DataFrame, floor: float = FORECAST_FLOOR) -> pd.DataFrame:
+    """Clip forecast point estimates and lower bounds at the given floor."""
+    if df.empty:
+        return df
+    for col in ["forecast_value", "lower_ci"]:
+        if col in df.columns:
+            df[col] = df[col].clip(lower=floor)
+    return df
+
+
+# ===========================
 # MAIN
 # ===========================
 
 def main():
     print("Loading data...")
     df_all = pd.read_excel(INPUT_FILE)
+    df_all = aggregate_monthly_duplicates(df_all)
     df_all[COL_DATE] = pd.to_datetime(df_all[COL_DATE])
     df_all = df_all.sort_values([COL_PRODUCT, COL_DIVISION, COL_DATE])
 
@@ -488,7 +579,7 @@ def main():
     model_choices = load_model_choices(SUMMARY_FILE)
 
     print("Loading per-SKU orders...")
-    orders_map = load_orders_map(ORDER_FILE)
+    orders_map = load_orders_map(ORDER_FILE, overrides_path=NOTES_FILE)
 
     results_rows = []
     sku_groups = df_all.groupby([COL_PRODUCT, COL_DIVISION], dropna=False)
@@ -553,6 +644,22 @@ def main():
     # Keep original SKU identifiers alongside normalized columns
     all_forecasts[COL_PRODUCT] = all_forecasts["product_id"]
     all_forecasts[COL_DIVISION] = all_forecasts["bu_id"]
+
+    # Format forecast_month for Excel as MM/DD/YYYY to avoid time components
+    all_forecasts["forecast_month"] = pd.to_datetime(all_forecasts["forecast_month"]).dt.strftime("%m/%d/%Y")
+
+    # Add concatenated key column (product|BU|forecast_month|model_type) with month in "MMM YY" format; move to first position
+    fc_month_short = pd.to_datetime(all_forecasts["forecast_month"]).dt.strftime("%b %y")
+    key_col = (
+        all_forecasts["product_id"].astype(str)
+        + "|"
+        + all_forecasts[COL_DIVISION].astype(str)
+        + "|"
+        + fc_month_short.astype(str)
+        + "|"
+        + all_forecasts["model_type"].astype(str)
+    )
+    all_forecasts.insert(0, "product_bu_forecast_month_model_type", key_col)
 
     print("\nWriting combined forecasts...")
     first_fc_dt = pd.to_datetime(all_forecasts["forecast_month"]).min()

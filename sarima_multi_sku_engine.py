@@ -3,7 +3,9 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import ast
+import os
 import time
+from typing import List, Optional
 import numpy as np
 import pandas as pd
 from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -16,13 +18,14 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 INPUT_FILE = "all_products_with_sf_and_bookings.xlsx"  # <--- change to your file
 OUTPUT_FILE = "sarima_multi_sku_summary.xlsx"
 ORDER_FILE = "sarimax_order_search_summary.xlsx"       # per-SKU SARIMA orders
+NOTES_FILE = "Notes.xlsx"                              # manual order overrides
 
 # Column names – adjust if your master file uses different names
 COL_PRODUCT = "Product"
 COL_DIVISION = "Division"
 COL_DATE = "Month"
 COL_ACTUALS = "Actuals"
-COL_NEW_QUOTES = "New_Quotes"
+COL_NEW_OPPORTUNITIES = "New_Opportunities"
 COL_OPEN_OPPS = "Open_Opportunities"
 COL_BOOKINGS = "Bookings"
 
@@ -35,11 +38,46 @@ ROCV_HORIZON = 1        # 1-step ahead in ROCV
 # Acceptance thresholds
 EPSILON_IMPROVEMENT = 0.02  # model must improve Test MAE by at least 2%
 DELTA_ROCV_TOLERANCE = 0.05 # ROCV_MAE can be up to 5% worse than baseline
+BASELINE_MAE_ZERO_EPS = 1e-9  # treat MAE at or below this as effectively zero
 
 
 # ===========================
 # 2. HELPER FUNCTIONS
 # ===========================
+
+def aggregate_monthly_duplicates(
+    df: pd.DataFrame,
+    product_col: str = COL_PRODUCT,
+    division_col: str = COL_DIVISION,
+    date_col: str = COL_DATE,
+    sum_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Collapse duplicate Product/Division/Month rows by summing key numeric fields.
+    Any extra columns are preserved by taking the first value within each group.
+    """
+    df = df.copy()
+    if date_col in df.columns:
+        df[date_col] = pd.to_datetime(df[date_col])
+
+    # Only sum true additive series; keep others (e.g., opportunities) as first.
+    sum_cols = sum_cols or [COL_ACTUALS, COL_BOOKINGS]
+    present_sum_cols = [c for c in sum_cols if c in df.columns]
+
+    group_cols = [c for c in [product_col, division_col, date_col] if c in df.columns]
+    agg_dict = {col: "sum" for col in present_sum_cols}
+    for col in df.columns:
+        if col in group_cols or col in agg_dict:
+            continue
+        agg_dict[col] = "first"
+
+    aggregated = (
+        df.groupby(group_cols, dropna=False, as_index=False)
+        .agg(agg_dict)
+        .sort_values(group_cols)
+    )
+    return aggregated
+
 
 def safe_mae(y_true, y_pred):
     """Compute MAE robustly."""
@@ -448,15 +486,15 @@ def engineer_regressors(df_sku):
     """
     df = df_sku.copy()
     # Ensure numeric
-    for col in [COL_NEW_QUOTES, COL_OPEN_OPPS, COL_BOOKINGS]:
+    for col in [COL_NEW_OPPORTUNITIES, COL_OPEN_OPPS, COL_BOOKINGS]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # Lagged features we are willing to use (1-3 where applicable)
-    if COL_NEW_QUOTES in df.columns:
-        df["New_Quotes_l1"] = df[COL_NEW_QUOTES].shift(1)
-        df["New_Quotes_l2"] = df[COL_NEW_QUOTES].shift(2)
-        df["New_Quotes_l3"] = df[COL_NEW_QUOTES].shift(3)
+    if COL_NEW_OPPORTUNITIES in df.columns:
+        df["New_Opportunities_l1"] = df[COL_NEW_OPPORTUNITIES].shift(1)
+        df["New_Opportunities_l2"] = df[COL_NEW_OPPORTUNITIES].shift(2)
+        df["New_Opportunities_l3"] = df[COL_NEW_OPPORTUNITIES].shift(3)
 
     if COL_OPEN_OPPS in df.columns:
         df["Open_Opportunities_l1"] = df[COL_OPEN_OPPS].shift(1)
@@ -504,7 +542,42 @@ def _parse_order_cell(value, expected_len):
         return None
 
 
-def load_orders_map(path=ORDER_FILE):
+def _load_manual_order_overrides(path=NOTES_FILE):
+    """Load manual SARIMA orders from Notes.xlsx if available."""
+    if path is None or not os.path.exists(path):
+        return {}
+    try:
+        df_notes = pd.read_excel(path)
+    except Exception as exc:
+        print(f"Could not read manual overrides from {path}: {exc}")
+        return {}
+
+    # Support either the main column names or the Notes.xlsx schema (group_key/BU).
+    product_col = COL_PRODUCT if COL_PRODUCT in df_notes.columns else None
+    division_col = COL_DIVISION if COL_DIVISION in df_notes.columns else None
+    if product_col is None and "group_key" in df_notes.columns:
+        product_col = "group_key"
+    if division_col is None and "BU" in df_notes.columns:
+        division_col = "BU"
+
+    required_cols = {product_col, division_col, "Chosen_Order", "Chosen_Seasonal_Order"}
+    if None in required_cols or not required_cols.issubset(df_notes.columns):
+        print(f"Manual overrides file {path} is missing required columns; skipping.")
+        return {}
+
+    overrides = {}
+    for _, row in df_notes.iterrows():
+        order = _parse_order_cell(row["Chosen_Order"], 3)
+        seas_order = _parse_order_cell(row["Chosen_Seasonal_Order"], 4)
+        if order is None or seas_order is None:
+            continue
+        prod = row[product_col]
+        div = row[division_col]
+        overrides[(prod, div)] = (order, seas_order)
+    return overrides
+
+
+def load_orders_map(path=ORDER_FILE, overrides_path=None):
     """
     Load per-SKU SARIMA orders from Excel.
     Returns dict keyed by (Product, Division) with (order, seasonal_order) tuples.
@@ -524,14 +597,20 @@ def load_orders_map(path=ORDER_FILE):
         if order is None or seas_order is None:
             continue
         orders_map[(prod, div)] = (order, seas_order)
+
+    overrides = _load_manual_order_overrides(overrides_path or NOTES_FILE)
+    if overrides:
+        orders_map.update(overrides)
+        print(f"Applied {len(overrides)} manual order override(s) from {overrides_path or NOTES_FILE}.")
     return orders_map
 
 
 def main():
     print("Loading data...")
     df_all = pd.read_excel(INPUT_FILE)
+    df_all = aggregate_monthly_duplicates(df_all)
     print(f"Loading per-SKU SARIMA orders from {ORDER_FILE}...")
-    orders_map = load_orders_map(ORDER_FILE)
+    orders_map = load_orders_map(ORDER_FILE, overrides_path=NOTES_FILE)
 
     # Basic cleaning
     df_all[COL_DATE] = pd.to_datetime(df_all[COL_DATE])
@@ -624,6 +703,12 @@ def main():
             bu=div,
             rocv_spec=baseline_rocv_spec
         )
+        if (
+            baseline_metrics is not None
+            and not np.isnan(baseline_metrics.get("Test_MAE", np.nan))
+            and abs(baseline_metrics["Test_MAE"]) <= BASELINE_MAE_ZERO_EPS
+        ):
+            print(f"[INFO] Baseline MAE ~0 for {prod}/{div}; treating as perfect baseline.")
         metrics_list.append(baseline_metrics)
         ranking_rows.append({
             "Product": prod,
@@ -639,9 +724,9 @@ def main():
             "Accepted_by_rules": False  # baseline not part of acceptance set
         })
 
-        # --- SARIMAX with New_Quotes lags 1-3 ---
+        # --- SARIMAX with New_Opportunities lags 1-3 ---
         for lag in [1, 2, 3]:
-            col = f"New_Quotes_l{lag}"
+            col = f"New_Opportunities_l{lag}"
             if col in df_sku.columns:
                 print(f"  Fitting SARIMAX_{col}...")
                 exog_series = df_sku[col].astype(float)
@@ -674,7 +759,7 @@ def main():
                     "ROCV_MAE": metrics_row["ROCV_MAE"],
                     "AIC": metrics_row["AIC"],
                     "BIC": metrics_row["BIC"],
-                    "Regressor_Name": "New_Quotes",
+                    "Regressor_Name": "New_Opportunities",
                     "Regressor_Lag": lag,
                     "Accepted_by_rules": False  # updated later once chosen
                 })
@@ -805,7 +890,10 @@ def main():
 
         # Improvement %
         if not np.isnan(baseline_mae) and not np.isnan(chosen_mae):
-            mae_improvement_pct = (baseline_mae - chosen_mae) / baseline_mae
+            if abs(baseline_mae) <= BASELINE_MAE_ZERO_EPS:
+                mae_improvement_pct = np.nan
+            else:
+                mae_improvement_pct = (baseline_mae - chosen_mae) / baseline_mae
         else:
             mae_improvement_pct = np.nan
 
@@ -813,8 +901,8 @@ def main():
         regressor_name = None
         regressor_lag = None
         if best_model["Model"].startswith("SARIMAX"):
-            if "New_Quotes" in best_model["Model"]:
-                regressor_name = "New_Quotes"
+            if "New_Opportunities" in best_model["Model"]:
+                regressor_name = "New_Opportunities"
                 if "_l" in best_model["Model"]:
                     regressor_lag = int(best_model["Model"].split("_l")[-1])
             elif "Open_Opportunities" in best_model["Model"]:
@@ -831,8 +919,8 @@ def main():
         best_nonbaseline_reg_name = None
         best_nonbaseline_reg_lag = None
         if best_nonbaseline_model is not None and best_nonbaseline_model.startswith("SARIMAX"):
-            if "New_Quotes" in best_nonbaseline_model:
-                best_nonbaseline_reg_name = "New_Quotes"
+            if "New_Opportunities" in best_nonbaseline_model:
+                best_nonbaseline_reg_name = "New_Opportunities"
                 if "_l" in best_nonbaseline_model:
                     best_nonbaseline_reg_lag = int(best_nonbaseline_model.split("_l")[-1])
             elif "Open_Opportunities" in best_nonbaseline_model:
@@ -894,6 +982,10 @@ def main():
         "Baseline_AIC", "Baseline_BIC",
         "Chosen_AIC", "Chosen_BIC"
     ]
+    # Ensure any missing columns exist (e.g., when rows were skipped or failed early)
+    for col in col_order:
+        if col not in df_results.columns:
+            df_results[col] = np.nan
     df_results = df_results[col_order]
 
     # Build ranking table (one row per model candidate) if available

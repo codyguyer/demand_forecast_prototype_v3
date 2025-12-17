@@ -30,7 +30,44 @@ ROCV_SPLITS = 3    # number of rolling splits
 TOP_N_CANDIDATES = 5
 HOLDOUT_HORIZON = 12
 MIN_TRAIN_FOR_HOLDOUT = 24
-MIN_SERIES_LENGTH = 36  # guardrail to skip very short series
+MIN_SERIES_LENGTH = 30  # guardrail to skip very short series
+
+
+# --------------------------------------------------
+# DATA PREP
+# --------------------------------------------------
+def aggregate_monthly_duplicates(
+    df: pd.DataFrame,
+    product_col: str = "Product",
+    division_col: str = "Division",
+    date_col: str = "Month",
+    sum_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Collapse duplicate Product/Division/Month rows by summing key numeric fields.
+    Also preserves any extra columns by taking the first value within each group.
+    """
+    df = df.copy()
+    if date_col in df.columns:
+        df[date_col] = pd.to_datetime(df[date_col])
+
+    # Only sum true additive series; keep others (e.g., opportunities) as first.
+    sum_cols = sum_cols or ["Actuals", "Bookings"]
+    present_sum_cols = [c for c in sum_cols if c in df.columns]
+
+    group_cols = [c for c in [product_col, division_col, date_col] if c in df.columns]
+    agg_dict = {col: "sum" for col in present_sum_cols}
+    for col in df.columns:
+        if col in group_cols or col in agg_dict:
+            continue
+        agg_dict[col] = "first"
+
+    aggregated = (
+        df.groupby(group_cols, dropna=False, as_index=False)
+        .agg(agg_dict)
+        .sort_values(group_cols)
+    )
+    return aggregated
 
 
 # --------------------------------------------------
@@ -325,10 +362,16 @@ if __name__ == "__main__":
     t0 = time.perf_counter()
     combined_file = "all_products_with_sf_and_bookings.xlsx"
     df_all = pd.read_excel(combined_file)
+    df_all = aggregate_monthly_duplicates(
+        df_all,
+        product_col="Product",
+        division_col="Division",
+        date_col="Month",
+    )
 
     exog_columns = [
         "Open_Opportunities",
-        "New_Quotes",
+        "New_Opportunities",
         "Bookings",
     ]
 
