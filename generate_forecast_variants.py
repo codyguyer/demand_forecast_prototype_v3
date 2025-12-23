@@ -1,5 +1,8 @@
 import uuid
 import pandas as pd
+import numpy as np
+from statsmodels.tsa.exponential_smoothing.ets import ETSModel
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 
@@ -16,7 +19,7 @@ def generate_forecast_variants(
 ):
     """
     Returns a long-form DataFrame with:
-    SARIMA baseline, ARIMA baseline, and SARIMAX-with-regressor (if exog provided).
+    SARIMA baseline, ETS baseline, and SARIMAX-with-regressor (if exog provided).
     """
 
     run_id = uuid.uuid4()
@@ -43,27 +46,118 @@ def generate_forecast_variants(
     sarima_df["regressor_details"] = [None] * len(sarima_df)
 
     # ---------------------------
-    # 2) ARIMA baseline (seasonal orders set to 0)
+    # 2) ETS baseline (AICc/AIC selection)
     # ---------------------------
-    arima_model = SARIMAX(
-        y,
-        order=sarima_order,
-        seasonal_order=(0,0,0,0),
-        enforce_stationarity=False,
-        enforce_invertibility=False
-    ).fit()
+    def _series_is_nonnegative(y_series):
+        y_clean = pd.Series(y_series).dropna()
+        return (not y_clean.empty) and (y_clean >= 0).all()
 
-    arima_forecast = arima_model.get_forecast(steps=horizon)
-    arima_mean = arima_forecast.predicted_mean
-    arima_df = arima_mean.to_frame(name="forecast_value")
-    arima_df["model_group"] = "baseline_arima"
-    arima_df["model_type"]  = "ARIMA"
-    arima_df["p"], arima_df["d"], arima_df["q"] = sarima_order
-    arima_df["P"], arima_df["D"], arima_df["Q"], arima_df["s"] = (0,0,0,0)
-    arima_df["regressor_names"]   = [None] * len(arima_df)
-    arima_df["regressor_details"] = [None] * len(arima_df)
+    def _ets_candidate_specs(y_series):
+        allow_mul = _series_is_nonnegative(y_series)
+        error_opts = ["add"] + (["mul"] if allow_mul else [])
+        trend_opts = [None, "add"]
+        seasonal_opts = [None, "add"] + (["mul"] if allow_mul else [])
+        specs = []
+        for error in error_opts:
+            for trend in trend_opts:
+                damped_opts = [False] if trend is None else [False, True]
+                for damped in damped_opts:
+                    for seasonal in seasonal_opts:
+                        specs.append({
+                            "error": error,
+                            "trend": trend,
+                            "damped_trend": damped,
+                            "seasonal": seasonal,
+                            "seasonal_periods": 12 if seasonal is not None else None,
+                        })
+        return specs
 
-    dfs = [sarima_df, arima_df]
+    def _info_criterion(res):
+        aicc = getattr(res, "aicc", None)
+        if aicc is not None and np.isfinite(aicc):
+            return float(aicc)
+        aic = getattr(res, "aic", None)
+        if aic is not None and np.isfinite(aic):
+            return float(aic)
+        return np.inf
+
+    def _fit_ets_candidate(y_series, spec, use_state_space):
+        if use_state_space:
+            model = ETSModel(
+                y_series,
+                error=spec["error"],
+                trend=spec["trend"],
+                damped_trend=spec["damped_trend"],
+                seasonal=spec["seasonal"],
+                seasonal_periods=spec["seasonal_periods"],
+                initialization_method="estimated",
+            )
+            return model.fit()
+        model = ExponentialSmoothing(
+            y_series,
+            trend=spec["trend"],
+            damped_trend=spec["damped_trend"] if spec["trend"] is not None else False,
+            seasonal=spec["seasonal"],
+            seasonal_periods=spec["seasonal_periods"] if spec["seasonal"] is not None else None,
+            initialization_method="estimated",
+        )
+        return model.fit(optimized=True)
+
+    def _select_best_ets_model(y_series):
+        best_res = None
+        best_spec = None
+        best_score = np.inf
+
+        for spec in _ets_candidate_specs(y_series):
+            try:
+                res = _fit_ets_candidate(y_series, spec, use_state_space=True)
+                score = _info_criterion(res)
+            except Exception:
+                continue
+            if score < best_score:
+                best_res = res
+                best_spec = spec
+                best_score = score
+
+        if best_res is not None:
+            return best_res, best_spec
+
+        for spec in _ets_candidate_specs(y_series):
+            if spec["error"] != "add":
+                continue
+            try:
+                res = _fit_ets_candidate(y_series, spec, use_state_space=False)
+                score = _info_criterion(res)
+            except Exception:
+                continue
+            if score < best_score:
+                best_res = res
+                best_spec = spec
+                best_score = score
+        return best_res, best_spec
+
+    ets_df = None
+    try:
+        ets_res, _ets_spec = _select_best_ets_model(y)
+        if ets_res is None:
+            raise ValueError("ETS baseline could not be fit.")
+        try:
+            ets_forecast = ets_res.get_forecast(steps=horizon)
+            ets_mean = ets_forecast.predicted_mean
+        except Exception:
+            ets_mean = ets_res.forecast(steps=horizon)
+
+        ets_df = ets_mean.to_frame(name="forecast_value")
+        ets_df["model_group"] = "baseline_ets"
+        ets_df["model_type"]  = "ETS"
+        ets_df["p"], ets_df["d"], ets_df["q"] = (np.nan, np.nan, np.nan)
+        ets_df["P"], ets_df["D"], ets_df["Q"], ets_df["s"] = (np.nan, np.nan, np.nan, np.nan)
+        ets_df["regressor_names"]   = [None] * len(ets_df)
+        ets_df["regressor_details"] = [None] * len(ets_df)
+    except Exception as exc:
+        print(f"[WARN] ETS baseline failed: {exc}")
+
+    dfs = [sarima_df] + ([ets_df] if ets_df is not None else [])
 
     # ---------------------------
     # 3) With regressor(s), if provided

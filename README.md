@@ -4,8 +4,8 @@ Python scripts for selecting SARIMA/SARIMAX orders by SKU, evaluating exogenous 
 
 ## Repository contents
 - `sarima_order_selector.py` — grid-searches SARIMA/SARIMAX orders per (Product, Division) with rolling-origin CV and a holdout block; writes `sarimax_order_search_summary.xlsx`.
-- `sarima_multi_sku_engine.py` — uses the chosen orders to compare baseline SARIMA vs. SARIMAX models with lagged regressors; writes `sarima_multi_sku_summary.xlsx`.
-- `sarima_forecast.py` — builds forecast variants (baseline SARIMA/ARIMA and SARIMAX if allowed) for each SKU; writes `stats_model_forecasts_YYYY-Mon.xlsx`.
+- `sarima_multi_sku_engine.py` — uses the chosen orders to compare baseline SARIMA/ETS vs. SARIMAX models with lagged regressors; writes `sarima_multi_sku_summary.xlsx`.
+- `sarima_forecast.py` — builds forecast variants (baseline SARIMA/ETS and SARIMAX if allowed) for each SKU; writes `stats_model_forecasts_YYYY-Mon.xlsx`.
 - `generate_forecast_variants.py` — small utility showing how to assemble forecast variants for a given SKU (used as a reference/helper).
 - `.gitignore` — excludes data files (`*.xlsx`, `*.csv`) and Python build artifacts.
 

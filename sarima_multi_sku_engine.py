@@ -8,6 +8,8 @@ import time
 from typing import List, Optional
 import numpy as np
 import pandas as pd
+from statsmodels.tsa.exponential_smoothing.ets import ETSModel
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
@@ -39,6 +41,7 @@ ROCV_HORIZON = 1        # 1-step ahead in ROCV
 EPSILON_IMPROVEMENT = 0.02  # model must improve Test MAE by at least 2%
 DELTA_ROCV_TOLERANCE = 0.05 # ROCV_MAE can be up to 5% worse than baseline
 BASELINE_MAE_ZERO_EPS = 1e-9  # treat MAE at or below this as effectively zero
+ETS_SEASONAL_PERIODS = 12     # monthly data
 
 
 # ===========================
@@ -189,6 +192,161 @@ def rolling_origin_cv_precomputed(rocv_spec, order=None, seasonal_order=None):
     if len(errors) == 0:
         return np.nan
 
+    return float(np.mean(errors))
+
+
+def _series_is_nonnegative(y_series) -> bool:
+    """Treat zeros as positive for multiplicative eligibility checks."""
+    y_clean = pd.Series(y_series).dropna()
+    if y_clean.empty:
+        return False
+    return (y_clean >= 0).all()
+
+
+def _ets_candidate_specs(y_series) -> List[dict]:
+    """Build a small, industry-standard ETS candidate grid."""
+    allow_mul = _series_is_nonnegative(y_series)
+    error_opts = ["add"] + (["mul"] if allow_mul else [])
+    trend_opts = [None, "add"]
+    seasonal_opts = [None, "add"] + (["mul"] if allow_mul else [])
+
+    candidates = []
+    for error in error_opts:
+        for trend in trend_opts:
+            damped_opts = [False] if trend is None else [False, True]
+            for damped in damped_opts:
+                for seasonal in seasonal_opts:
+                    candidates.append({
+                        "error": error,
+                        "trend": trend,
+                        "damped_trend": damped,
+                        "seasonal": seasonal,
+                        "seasonal_periods": ETS_SEASONAL_PERIODS if seasonal is not None else None,
+                    })
+    return candidates
+
+
+def _info_criterion(res) -> float:
+    """Prefer AICc when available; fall back to AIC."""
+    aicc = getattr(res, "aicc", None)
+    if aicc is not None and np.isfinite(aicc):
+        return float(aicc)
+    aic = getattr(res, "aic", None)
+    if aic is not None and np.isfinite(aic):
+        return float(aic)
+    return np.inf
+
+
+def _fit_ets_candidate(y_train, spec, use_state_space: bool):
+    """Fit a single ETS candidate using the requested backend."""
+    if use_state_space:
+        model = ETSModel(
+            y_train,
+            error=spec["error"],
+            trend=spec["trend"],
+            damped_trend=spec["damped_trend"],
+            seasonal=spec["seasonal"],
+            seasonal_periods=spec["seasonal_periods"],
+            initialization_method="estimated",
+        )
+        return model.fit()
+
+    model = ExponentialSmoothing(
+        y_train,
+        trend=spec["trend"],
+        damped_trend=spec["damped_trend"] if spec["trend"] is not None else False,
+        seasonal=spec["seasonal"],
+        seasonal_periods=spec["seasonal_periods"] if spec["seasonal"] is not None else None,
+        initialization_method="estimated",
+    )
+    return model.fit(optimized=True)
+
+
+def _select_best_ets_model(y_train, context: str = ""):
+    """Choose the best ETS candidate by AICc (or AIC) within a SKU."""
+    best_res = None
+    best_spec = None
+    best_score = np.inf
+
+    for spec in _ets_candidate_specs(y_train):
+        try:
+            res = _fit_ets_candidate(y_train, spec, use_state_space=True)
+            score = _info_criterion(res)
+        except Exception as exc:
+            print(f"[WARN] ETSModel failed ({spec}){context}: {exc}")
+            continue
+
+        if score < best_score:
+            best_res = res
+            best_spec = spec
+            best_score = score
+
+    if best_res is not None:
+        return best_res, best_spec, "ETSModel"
+
+    # Fallback: only if ETSModel cannot fit anything
+    for spec in _ets_candidate_specs(y_train):
+        if spec["error"] != "add":
+            continue
+        try:
+            res = _fit_ets_candidate(y_train, spec, use_state_space=False)
+            score = _info_criterion(res)
+        except Exception as exc:
+            print(f"[WARN] ExponentialSmoothing failed ({spec}){context}: {exc}")
+            continue
+
+        if score < best_score:
+            best_res = res
+            best_spec = spec
+            best_score = score
+
+    if best_res is None:
+        return None, None, None
+    return best_res, best_spec, "ExponentialSmoothing"
+
+
+def _forecast_ets(res, steps, index):
+    """Forecast ETS model and align to the provided index."""
+    mean = None
+    try:
+        forecast_res = res.get_forecast(steps=steps)
+        mean = forecast_res.predicted_mean
+    except Exception:
+        if hasattr(res, "forecast"):
+            mean = res.forecast(steps=steps)
+
+    if mean is None:
+        raise ValueError("ETS forecast failed")
+    return pd.Series(mean, index=index)
+
+
+def rolling_origin_cv_ets_precomputed(rocv_spec, ets_spec, impl, horizon=ROCV_HORIZON):
+    """Rolling-origin CV for ETS using a fixed spec and backend."""
+    if rocv_spec is None:
+        return np.nan
+
+    y_clean = rocv_spec["y_clean"]
+    origins = rocv_spec.get("origins", [])
+    if not origins:
+        return np.nan
+
+    errors = []
+    for origin in origins:
+        y_train = y_clean.iloc[:origin]
+        y_test_point = y_clean.iloc[origin:origin + horizon]
+
+        try:
+            res = _fit_ets_candidate(y_train, ets_spec, use_state_space=(impl == "ETSModel"))
+            preds = _forecast_ets(res, steps=horizon, index=y_test_point.index)
+        except Exception:
+            continue
+
+        err = safe_mae(y_test_point.values, preds.values)
+        if not np.isnan(err):
+            errors.append(err)
+
+    if len(errors) == 0:
+        return np.nan
     return float(np.mean(errors))
 
 
@@ -408,6 +566,73 @@ def evaluate_single_model(
         }
 
 
+def evaluate_ets_model(
+    y,
+    model_name="ETS_baseline",
+    horizon=TEST_HORIZON,
+    sku=None,
+    bu=None,
+    rocv_spec=None,
+):
+    """
+    Fit ETS (best by AICc/AIC), compute test MAE/RMSE on last 'horizon' points,
+    compute ROCV MAE, and return a dict of metrics.
+    """
+    y = pd.Series(y).astype(float)
+    n_total = len(y)
+
+    if n_total <= horizon + 5:
+        return {
+            "Model": model_name,
+            "Test_MAE": np.nan,
+            "Test_RMSE": np.nan,
+            "AIC": np.nan,
+            "BIC": np.nan,
+            "ROCV_MAE": np.nan,
+            "Regressor_coef": np.nan,
+            "Regressor_pvalue": np.nan
+        }
+
+    train_end = n_total - horizon
+    y_train = y.iloc[:train_end]
+    y_test = y.iloc[train_end:]
+
+    context = f" for {sku}/{bu}" if sku or bu else ""
+    ets_res, ets_spec, ets_impl = _select_best_ets_model(y_train, context=context)
+    if ets_res is None:
+        return {
+            "Model": model_name,
+            "Test_MAE": np.nan,
+            "Test_RMSE": np.nan,
+            "AIC": np.nan,
+            "BIC": np.nan,
+            "ROCV_MAE": np.nan,
+            "Regressor_coef": np.nan,
+            "Regressor_pvalue": np.nan
+        }
+
+    try:
+        y_pred = _forecast_ets(ets_res, steps=horizon, index=y_test.index)
+    except Exception:
+        y_pred = pd.Series(index=y_test.index, data=np.nan)
+
+    rocv_mae = rolling_origin_cv_ets_precomputed(rocv_spec, ets_spec, ets_impl)
+
+    aic = getattr(ets_res, "aic", np.nan)
+    bic = getattr(ets_res, "bic", np.nan)
+
+    return {
+        "Model": model_name,
+        "Test_MAE": safe_mae(y_test.values, y_pred.values),
+        "Test_RMSE": safe_rmse(y_test.values, y_pred.values),
+        "AIC": float(aic) if np.isfinite(aic) else np.nan,
+        "BIC": float(bic) if np.isfinite(bic) else np.nan,
+        "ROCV_MAE": float(rocv_mae) if rocv_mae is not None else np.nan,
+        "Regressor_coef": np.nan,
+        "Regressor_pvalue": np.nan
+    }
+
+
 def choose_best_model(metrics_list, epsilon=EPSILON_IMPROVEMENT, delta=DELTA_ROCV_TOLERANCE):
     """
     Given a list of metrics dicts (all for same SKU),
@@ -417,19 +642,24 @@ def choose_best_model(metrics_list, epsilon=EPSILON_IMPROVEMENT, delta=DELTA_ROC
     if not metrics_list:
         return None, None
 
-    # Identify baseline and copy it out
-    baseline = None
-    for m in metrics_list:
-        if m["Model"] == "SARIMA_baseline":
-            baseline = m
-            break
+    def mae_rmse_key(m):
+        mae = m.get("Test_MAE", np.nan)
+        rmse = m.get("Test_RMSE", np.nan)
+        return (
+            mae if np.isfinite(mae) else np.inf,
+            rmse if np.isfinite(rmse) else np.inf,
+        )
+
+    baseline_models = {"SARIMA_baseline", "ETS_baseline"}
+    baseline_candidates = [m for m in metrics_list if m["Model"] in baseline_models]
+    baseline = min(baseline_candidates, key=mae_rmse_key) if baseline_candidates else None
 
     if baseline is None:
         # Fallback: choose minimum Test_MAE
         valid = [m for m in metrics_list if not np.isnan(m["Test_MAE"])]
         if not valid:
             return None, None
-        best = min(valid, key=lambda x: x["Test_MAE"])
+        best = min(valid, key=mae_rmse_key)
         return best, None
 
     baseline_mae = baseline["Test_MAE"]
@@ -440,12 +670,12 @@ def choose_best_model(metrics_list, epsilon=EPSILON_IMPROVEMENT, delta=DELTA_ROC
         valid = [m for m in metrics_list if not np.isnan(m["Test_MAE"])]
         if not valid:
             return None, baseline
-        best = min(valid, key=lambda x: x["Test_MAE"])
+        best = min(valid, key=mae_rmse_key)
         return best, baseline
 
     accepted = []
     for m in metrics_list:
-        if m["Model"] == "SARIMA_baseline":
+        if m["Model"] in baseline_models:
             continue  # baseline is always a fallback, not an "accepted regressor" candidate
 
         mae = m["Test_MAE"]
@@ -474,7 +704,7 @@ def choose_best_model(metrics_list, epsilon=EPSILON_IMPROVEMENT, delta=DELTA_ROC
         return baseline, baseline
 
     # If multiple accepted, choose the one with lowest Test_MAE
-    best = min(accepted, key=lambda x: x["Test_MAE"])
+    best = min(accepted, key=mae_rmse_key)
     return best, baseline
 
 
@@ -724,6 +954,31 @@ def main():
             "Accepted_by_rules": False  # baseline not part of acceptance set
         })
 
+        # --- ETS baseline ---
+        print("  Fitting ETS_baseline...")
+        ets_metrics = evaluate_ets_model(
+            y=y,
+            model_name="ETS_baseline",
+            horizon=TEST_HORIZON,
+            sku=prod,
+            bu=div,
+            rocv_spec=baseline_rocv_spec
+        )
+        metrics_list.append(ets_metrics)
+        ranking_rows.append({
+            "Product": prod,
+            "Division": div,
+            "Model": ets_metrics["Model"],
+            "Test_MAE": ets_metrics["Test_MAE"],
+            "Test_RMSE": ets_metrics["Test_RMSE"],
+            "ROCV_MAE": ets_metrics["ROCV_MAE"],
+            "AIC": ets_metrics["AIC"],
+            "BIC": ets_metrics["BIC"],
+            "Regressor_Name": None,
+            "Regressor_Lag": None,
+            "Accepted_by_rules": False
+        })
+
         # --- SARIMAX with New_Opportunities lags 1-3 ---
         for lag in [1, 2, 3]:
             col = f"New_Opportunities_l{lag}"
@@ -848,8 +1103,22 @@ def main():
         best_model, baseline = choose_best_model(metrics_list)
 
         # Identify best non-baseline candidate by Test_MAE (forcing regressor if available)
-        non_baseline_candidates = [m for m in metrics_list if m["Model"] != "SARIMA_baseline" and not np.isnan(m["Test_MAE"])]
-        best_nonbaseline = min(non_baseline_candidates, key=lambda x: x["Test_MAE"]) if non_baseline_candidates else None
+        non_baseline_candidates = [
+            m for m in metrics_list
+            if m["Model"] not in {"SARIMA_baseline", "ETS_baseline"} and not np.isnan(m["Test_MAE"])
+        ]
+        def mae_rmse_key_local(m):
+            mae = m.get("Test_MAE", np.nan)
+            rmse = m.get("Test_RMSE", np.nan)
+            return (
+                mae if np.isfinite(mae) else np.inf,
+                rmse if np.isfinite(rmse) else np.inf,
+            )
+
+        best_nonbaseline = (
+            min(non_baseline_candidates, key=mae_rmse_key_local)
+            if non_baseline_candidates else None
+        )
 
         if best_model is None:
             print("  -> No valid model metrics; marking as FAILED.")
@@ -932,7 +1201,7 @@ def main():
                 if "_l" in best_nonbaseline_model:
                     best_nonbaseline_reg_lag = int(best_nonbaseline_model.split("_l")[-1])
 
-        accepted_by_rules = (best_model["Model"] != "SARIMA_baseline")
+        accepted_by_rules = (best_model["Model"] not in {"SARIMA_baseline", "ETS_baseline"})
 
         print(f"  -> Chosen model: {best_model['Model']}")
         print(f"     Baseline MAE: {baseline_mae:.3f} | Chosen MAE: {chosen_mae:.3f} | Improvement: {mae_improvement_pct * 100 if not np.isnan(mae_improvement_pct) else np.nan:.2f}%")

@@ -10,6 +10,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from pandas.tseries.frequencies import to_offset
+from statsmodels.tsa.exponential_smoothing.ets import ETSModel
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 
@@ -40,7 +42,7 @@ FORECAST_FLOOR = 0.0
 # Labels for outward-facing model descriptions
 MODEL_LABELS = {
     "baseline_sarima": "Seasonal Baseline",
-    "baseline_arima": "Non-Seasonal Baseline",
+    "baseline_ets": "ETS Baseline",
 }
 
 
@@ -231,7 +233,7 @@ def load_model_choices(path: str) -> Dict[Tuple[str, str], dict]:
         if not isinstance(model_name, str):
             return None, None
         model_name = model_name.strip()
-        if model_name == "SARIMA_baseline":
+        if model_name in {"SARIMA_baseline", "ETS_baseline"}:
             return None, None
         if "New_Opportunities" in model_name:
             return "New_Opportunities", 1
@@ -386,6 +388,148 @@ def _build_exog_frames(exog_series: Optional[pd.Series],
     return X_train, X_future
 
 
+def _series_is_nonnegative(y: pd.Series) -> bool:
+    """Treat zeros as positive for multiplicative eligibility checks."""
+    y_clean = pd.Series(y).dropna()
+    if y_clean.empty:
+        return False
+    return (y_clean >= 0).all()
+
+
+def _ets_candidate_specs(y: pd.Series) -> List[dict]:
+    """Build a small, industry-standard ETS candidate grid."""
+    allow_mul = _series_is_nonnegative(y)
+    error_opts = ["add"] + (["mul"] if allow_mul else [])
+    trend_opts = [None, "add"]
+    seasonal_opts = [None, "add"] + (["mul"] if allow_mul else [])
+
+    candidates = []
+    for error in error_opts:
+        for trend in trend_opts:
+            damped_opts = [False] if trend is None else [False, True]
+            for damped in damped_opts:
+                for seasonal in seasonal_opts:
+                    candidates.append({
+                        "error": error,
+                        "trend": trend,
+                        "damped_trend": damped,
+                        "seasonal": seasonal,
+                        "seasonal_periods": 12 if seasonal is not None else None,
+                    })
+    return candidates
+
+
+def _info_criterion(res) -> float:
+    """Prefer AICc when available; fall back to AIC."""
+    aicc = getattr(res, "aicc", None)
+    if aicc is not None and np.isfinite(aicc):
+        return float(aicc)
+    aic = getattr(res, "aic", None)
+    if aic is not None and np.isfinite(aic):
+        return float(aic)
+    return np.inf
+
+
+def _fit_ets_candidate(y_train: pd.Series, spec: dict, use_state_space: bool):
+    """Fit a single ETS candidate using the requested backend."""
+    if use_state_space:
+        model = ETSModel(
+            y_train,
+            error=spec["error"],
+            trend=spec["trend"],
+            damped_trend=spec["damped_trend"],
+            seasonal=spec["seasonal"],
+            seasonal_periods=spec["seasonal_periods"],
+            initialization_method="estimated",
+        )
+        return model.fit()
+
+    model = ExponentialSmoothing(
+        y_train,
+        trend=spec["trend"],
+        damped_trend=spec["damped_trend"] if spec["trend"] is not None else False,
+        seasonal=spec["seasonal"],
+        seasonal_periods=spec["seasonal_periods"] if spec["seasonal"] is not None else None,
+        initialization_method="estimated",
+    )
+    return model.fit(optimized=True)
+
+
+def _select_best_ets_model(y_train: pd.Series, context: str = ""):
+    """Choose the best ETS candidate by AICc (or AIC) within a SKU."""
+    best_res = None
+    best_spec = None
+    best_score = np.inf
+
+    for spec in _ets_candidate_specs(y_train):
+        try:
+            res = _fit_ets_candidate(y_train, spec, use_state_space=True)
+            score = _info_criterion(res)
+        except Exception as exc:
+            print(f"[WARN] ETSModel failed ({spec}){context}: {exc}")
+            continue
+
+        if score < best_score:
+            best_res = res
+            best_spec = spec
+            best_score = score
+
+    if best_res is not None:
+        return best_res, best_spec, "ETSModel"
+
+    # Fallback: only if ETSModel cannot fit anything
+    for spec in _ets_candidate_specs(y_train):
+        if spec["error"] != "add":
+            continue
+        try:
+            res = _fit_ets_candidate(y_train, spec, use_state_space=False)
+            score = _info_criterion(res)
+        except Exception as exc:
+            print(f"[WARN] ExponentialSmoothing failed ({spec}){context}: {exc}")
+            continue
+
+        if score < best_score:
+            best_res = res
+            best_spec = spec
+            best_score = score
+
+    if best_res is None:
+        return None, None, None
+    return best_res, best_spec, "ExponentialSmoothing"
+
+
+def _forecast_ets(res, forecast_index: pd.DatetimeIndex) -> Tuple[pd.Series, pd.DataFrame]:
+    """Generate ETS forecast mean and confidence intervals when available."""
+    steps = len(forecast_index)
+    mean = None
+    ci = None
+
+    try:
+        forecast_res = res.get_forecast(steps=steps)
+        mean = forecast_res.predicted_mean
+        try:
+            ci = forecast_res.conf_int(alpha=0.05)
+        except Exception:
+            ci = None
+    except Exception:
+        if hasattr(res, "forecast"):
+            mean = res.forecast(steps=steps)
+
+    if mean is None:
+        raise ValueError("ETS forecast failed")
+
+    mean = pd.Series(mean, index=forecast_index)
+    if ci is None:
+        ci = pd.DataFrame(
+            {"lower_ci": [np.nan] * steps, "upper_ci": [np.nan] * steps},
+            index=forecast_index,
+        )
+    else:
+        ci = pd.DataFrame(ci)
+        ci.index = forecast_index
+    return mean, ci
+
+
 def _fit_variant(y_train: pd.Series,
                  order: Tuple[int, int, int],
                  seasonal_order: Tuple[int, int, int, int],
@@ -424,7 +568,7 @@ def generate_forecast_variants(
     """
     Build a long-form table of forecasts for:
     - SARIMA baseline (seasonal)
-    - ARIMA baseline (non-seasonal) unless seasonal order already all zeros
+    - ETS baseline (selected by AICc/AIC over a small candidate grid)
     - SARIMAX with regressor (if provided and future exog is available)
     """
     run_id = uuid.uuid4()
@@ -461,37 +605,38 @@ def generate_forecast_variants(
     except Exception as exc:
         print(f"  Failed SARIMA baseline: {exc}")
 
-    # Non-seasonal baseline (skip if already non-seasonal)
-    seasonal_is_zero = seasonal_order[0] == 0 and seasonal_order[1] == 0 and seasonal_order[2] == 0
-    if not seasonal_is_zero:
-        try:
-            mean, ci = _fit_variant(
-                y_train=y.dropna(),
-                order=sarima_order,
-                seasonal_order=(0, 0, 0, 0),
-                forecast_index=forecast_index,
-            )
-            arima_df = pd.DataFrame({
-                "forecast_month": forecast_index,
-                "forecast_value": mean.values,
-                "lower_ci": ci.iloc[:, 0].values,
-                "upper_ci": ci.iloc[:, 1].values,
-                "model_group": "baseline_arima",
-                "model_type": "ARIMA",
-                "model_label": _natural_model_label("baseline_arima"),
-                "p": sarima_order[0],
-                "d": sarima_order[1],
-                "q": sarima_order[2],
-                "P": 0,
-                "D": 0,
-                "Q": 0,
-            "s": 0,
+    # ETS baseline (AICc/AIC selection)
+    try:
+        y_train = y.dropna()
+        ets_res, ets_spec, ets_impl = _select_best_ets_model(
+            y_train,
+            context=f" for {product_id}/{bu_id}"
+        )
+        if ets_res is None:
+            raise ValueError("No ETS candidate fit succeeded")
+
+        mean, ci = _forecast_ets(ets_res, forecast_index)
+        ets_df = pd.DataFrame({
+            "forecast_month": forecast_index,
+            "forecast_value": mean.values,
+            "lower_ci": ci.iloc[:, 0].values,
+            "upper_ci": ci.iloc[:, 1].values,
+            "model_group": "baseline_ets",
+            "model_type": "ETS",
+            "model_label": _natural_model_label("baseline_ets"),
+            "p": np.nan,
+            "d": np.nan,
+            "q": np.nan,
+            "P": np.nan,
+            "D": np.nan,
+            "Q": np.nan,
+            "s": np.nan,
             "regressor_names": None,
             "regressor_details": None,
         })
-            dfs.append(_apply_forecast_floor(arima_df))
-        except Exception as exc:
-            print(f"  Failed ARIMA baseline: {exc}")
+        dfs.append(_apply_forecast_floor(ets_df))
+    except Exception as exc:
+        print(f"  Failed ETS baseline: {exc}")
 
     # With regressor (SARIMAX)
     X_train, X_future = _build_exog_frames(exog_series, forecast_index)
@@ -615,7 +760,7 @@ def main():
 
         exog_series = get_exog_series(df_features, choice.get("reg_name"), choice.get("reg_lag"))
         # If choice is explicitly baseline, ignore regressors
-        if choice.get("model") == "SARIMA_baseline":
+        if choice.get("model") in {"SARIMA_baseline", "ETS_baseline"}:
             exog_series = None
 
         fc_df = generate_forecast_variants(
