@@ -38,6 +38,13 @@ COL_BOOKINGS = "Bookings"
 
 FORECAST_HORIZON = 12
 FORECAST_FLOOR = 0.0
+TEST_HORIZON_DEFAULT = 12
+MIN_TEST_WINDOW = 6
+ROCV_HORIZON = 12
+ROCV_MAX_ORIGINS = 12
+EPSILON_IMPROVEMENT_ABS = 10.0
+IMPROVEMENT_PCT = 0.05
+ROCV_TOLERANCE_PCT = 0.10
 
 # Labels for outward-facing model descriptions
 MODEL_LABELS = {
@@ -79,8 +86,8 @@ def aggregate_monthly_duplicates(
     if date_col in df.columns:
         df[date_col] = pd.to_datetime(df[date_col])
 
-    # Only sum true additive series; keep others (e.g., opportunities) as first.
-    sum_cols = sum_cols or [COL_ACTUALS, COL_BOOKINGS]
+    # Only sum true additive series; keep others (e.g., opportunities, bookings) as first.
+    sum_cols = sum_cols or [COL_ACTUALS]
     present_sum_cols = [c for c in sum_cols if c in df.columns]
 
     group_cols = [c for c in [product_col, division_col, date_col] if c in df.columns]
@@ -396,12 +403,15 @@ def _series_is_nonnegative(y: pd.Series) -> bool:
     return (y_clean >= 0).all()
 
 
-def _ets_candidate_specs(y: pd.Series) -> List[dict]:
+def _ets_candidate_specs(y: pd.Series, allow_seasonal: bool) -> List[dict]:
     """Build a small, industry-standard ETS candidate grid."""
     allow_mul = _series_is_nonnegative(y)
     error_opts = ["add"] + (["mul"] if allow_mul else [])
     trend_opts = [None, "add"]
-    seasonal_opts = [None, "add"] + (["mul"] if allow_mul else [])
+    if allow_seasonal:
+        seasonal_opts = [None, "add"] + (["mul"] if allow_mul else [])
+    else:
+        seasonal_opts = [None]
 
     candidates = []
     for error in error_opts:
@@ -455,13 +465,13 @@ def _fit_ets_candidate(y_train: pd.Series, spec: dict, use_state_space: bool):
     return model.fit(optimized=True)
 
 
-def _select_best_ets_model(y_train: pd.Series, context: str = ""):
+def _select_best_ets_model(y_train: pd.Series, allow_seasonal: bool, context: str = ""):
     """Choose the best ETS candidate by AICc (or AIC) within a SKU."""
     best_res = None
     best_spec = None
     best_score = np.inf
 
-    for spec in _ets_candidate_specs(y_train):
+    for spec in _ets_candidate_specs(y_train, allow_seasonal=allow_seasonal):
         try:
             res = _fit_ets_candidate(y_train, spec, use_state_space=True)
             score = _info_criterion(res)
@@ -478,7 +488,7 @@ def _select_best_ets_model(y_train: pd.Series, context: str = ""):
         return best_res, best_spec, "ETSModel"
 
     # Fallback: only if ETSModel cannot fit anything
-    for spec in _ets_candidate_specs(y_train):
+    for spec in _ets_candidate_specs(y_train, allow_seasonal=allow_seasonal):
         if spec["error"] != "add":
             continue
         try:
@@ -554,6 +564,262 @@ def _fit_variant(y_train: pd.Series,
     return mean, ci
 
 
+def _safe_mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Compute MAE while ignoring NaNs/Infs."""
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not mask.any():
+        return np.nan
+    return float(np.mean(np.abs(y_true[mask] - y_pred[mask])))
+
+
+def _safe_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Compute RMSE while ignoring NaNs/Infs."""
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not mask.any():
+        return np.nan
+    return float(np.sqrt(np.mean((y_true[mask] - y_pred[mask]) ** 2)))
+
+
+def _compute_test_window(history_months: int) -> int:
+    """Compute test window length based on history length."""
+    if history_months < 24:
+        return min(TEST_HORIZON_DEFAULT, max(MIN_TEST_WINDOW, int(np.floor(0.25 * history_months))))
+    return TEST_HORIZON_DEFAULT
+
+
+def _rocv_origins(n_obs: int, horizon: int, max_origins: int, min_train: int) -> List[int]:
+    """Return rolling-origin indices (train length) for ROCV."""
+    last_origin = n_obs - horizon
+    if last_origin <= min_train:
+        return []
+    origins = list(range(min_train, last_origin + 1))
+    if len(origins) > max_origins:
+        origins = origins[-max_origins:]
+    return origins
+
+
+def _sarimax_forecast_series(res, steps: int, exog_future: Optional[pd.DataFrame] = None) -> pd.Series:
+    """Forecast using a fitted SARIMAX model."""
+    forecast = res.get_forecast(steps=steps, exog=exog_future)
+    return forecast.predicted_mean
+
+
+def _evaluate_sarima_metrics(
+    y: pd.Series,
+    order: Tuple[int, int, int],
+    seasonal_order: Tuple[int, int, int, int],
+    test_window: int,
+    exog_series: Optional[pd.Series] = None,
+    rocv_horizon: int = ROCV_HORIZON,
+    rocv_max_origins: int = ROCV_MAX_ORIGINS,
+) -> dict:
+    """Fit SARIMA/X, compute test MAE/RMSE and ROCV MAE."""
+    y_clean = y.dropna().astype(float)
+    if len(y_clean) <= test_window:
+        return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
+
+    y_train = y_clean.iloc[:-test_window]
+    y_test = y_clean.iloc[-test_window:]
+
+    exog_train = None
+    exog_test = None
+    if exog_series is not None:
+        exog_series = exog_series.reindex(y_clean.index)
+        exog_train = exog_series.iloc[:-test_window].to_frame()
+        exog_test = exog_series.iloc[-test_window:].to_frame()
+        if exog_train.isna().any().any() or exog_test.isna().any().any():
+            return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
+
+    try:
+        res = SARIMAX(
+            y_train,
+            exog=exog_train,
+            order=order,
+            seasonal_order=seasonal_order,
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        ).fit(disp=False)
+        y_pred = _sarimax_forecast_series(res, steps=test_window, exog_future=exog_test)
+    except Exception:
+        return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
+
+    test_mae = _safe_mae(y_test.values, y_pred.values)
+    test_rmse = _safe_rmse(y_test.values, y_pred.values)
+
+    rocv_maes = []
+    min_train = max(12, rocv_horizon)
+    origins = _rocv_origins(len(y_clean), rocv_horizon, rocv_max_origins, min_train)
+    for origin in origins:
+        y_train_rocv = y_clean.iloc[:origin]
+        y_test_rocv = y_clean.iloc[origin:origin + rocv_horizon]
+        exog_train_rocv = None
+        exog_test_rocv = None
+        if exog_series is not None:
+            exog_train_rocv = exog_series.iloc[:origin].to_frame()
+            exog_test_rocv = exog_series.iloc[origin:origin + rocv_horizon].to_frame()
+            if exog_train_rocv.isna().any().any() or exog_test_rocv.isna().any().any():
+                continue
+        try:
+            res_rocv = SARIMAX(
+                y_train_rocv,
+                exog=exog_train_rocv,
+                order=order,
+                seasonal_order=seasonal_order,
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            ).fit(disp=False)
+            y_pred_rocv = _sarimax_forecast_series(res_rocv, steps=rocv_horizon, exog_future=exog_test_rocv)
+            mae = _safe_mae(y_test_rocv.values, y_pred_rocv.values)
+            if np.isfinite(mae):
+                rocv_maes.append(mae)
+        except Exception:
+            continue
+
+    rocv_mae = float(np.mean(rocv_maes)) if rocv_maes else np.nan
+    return {"Test_MAE": test_mae, "Test_RMSE": test_rmse, "ROCV_MAE": rocv_mae}
+
+
+def _evaluate_ets_metrics(
+    y: pd.Series,
+    test_window: int,
+    allow_seasonal: bool,
+    rocv_horizon: int = ROCV_HORIZON,
+    rocv_max_origins: int = ROCV_MAX_ORIGINS,
+) -> dict:
+    """Fit ETS, compute test MAE/RMSE and ROCV MAE."""
+    y_clean = y.dropna().astype(float)
+    if len(y_clean) <= test_window:
+        return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
+
+    y_train = y_clean.iloc[:-test_window]
+    y_test = y_clean.iloc[-test_window:]
+
+    ets_res, ets_spec, ets_impl = _select_best_ets_model(y_train, allow_seasonal=allow_seasonal, context="")
+    if ets_res is None:
+        return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
+
+    try:
+        y_pred = _forecast_ets(ets_res, y_test.index)[0]
+    except Exception:
+        return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
+
+    test_mae = _safe_mae(y_test.values, y_pred.values)
+    test_rmse = _safe_rmse(y_test.values, y_pred.values)
+
+    rocv_maes = []
+    min_train = max(12, rocv_horizon)
+    origins = _rocv_origins(len(y_clean), rocv_horizon, rocv_max_origins, min_train)
+    for origin in origins:
+        y_train_rocv = y_clean.iloc[:origin]
+        y_test_rocv = y_clean.iloc[origin:origin + rocv_horizon]
+        try:
+            res = _fit_ets_candidate(y_train_rocv, ets_spec, use_state_space=(ets_impl == "ETSModel"))
+            y_pred_rocv = _forecast_ets(res, y_test_rocv.index)[0]
+            mae = _safe_mae(y_test_rocv.values, y_pred_rocv.values)
+            if np.isfinite(mae):
+                rocv_maes.append(mae)
+        except Exception:
+            continue
+
+    rocv_mae = float(np.mean(rocv_maes)) if rocv_maes else np.nan
+    return {"Test_MAE": test_mae, "Test_RMSE": test_rmse, "ROCV_MAE": rocv_mae}
+
+
+def _accept_candidate(
+    candidate: dict,
+    baseline: dict,
+    epsilon_abs: float = EPSILON_IMPROVEMENT_ABS,
+    improvement_pct: float = IMPROVEMENT_PCT,
+    rocv_tol_pct: float = ROCV_TOLERANCE_PCT,
+) -> bool:
+    """Apply acceptance rules for non-baseline model candidates."""
+    cand_mae = candidate.get("Test_MAE", np.nan)
+    cand_rocv = candidate.get("ROCV_MAE", np.nan)
+    base_mae = baseline.get("Test_MAE", np.nan)
+    base_rocv = baseline.get("ROCV_MAE", np.nan)
+
+    if not np.isfinite(cand_mae) or not np.isfinite(base_mae):
+        return False
+
+    required_improvement = max(epsilon_abs, base_mae * improvement_pct)
+    if (base_mae - cand_mae) < required_improvement:
+        return False
+
+    if np.isfinite(base_rocv) and np.isfinite(cand_rocv):
+        if cand_rocv > base_rocv * (1.0 + rocv_tol_pct):
+            return False
+    elif np.isfinite(base_rocv) and not np.isfinite(cand_rocv):
+        return False
+
+    if np.isfinite(cand_rocv):
+        if abs(cand_rocv - cand_mae) > (rocv_tol_pct * max(cand_mae, 1e-9)):
+            return False
+
+    return True
+
+
+def _recommend_model_group(
+    y: pd.Series,
+    order: Tuple[int, int, int],
+    seasonal_order: Tuple[int, int, int, int],
+    exog_series: Optional[pd.Series],
+    allow_sarima: bool,
+    allow_sarimax: bool,
+    allow_ets_for_reco: bool,
+    allow_ets_seasonal: bool,
+) -> Optional[str]:
+    """Recommend a model group per SKU based on Test and ROCV metrics."""
+    y_clean = y.dropna().astype(float)
+    history_months = len(y_clean)
+    if history_months == 0:
+        return None
+
+    test_window = _compute_test_window(history_months)
+    metrics = []
+
+    baseline_group = "baseline_sarima" if allow_sarima else "baseline_ets"
+
+    if baseline_group == "baseline_sarima" and allow_sarima:
+        baseline_metrics = _evaluate_sarima_metrics(
+            y_clean, order, seasonal_order, test_window, exog_series=None
+        )
+    else:
+        baseline_metrics = _evaluate_ets_metrics(
+            y_clean, test_window, allow_seasonal=allow_ets_seasonal
+        )
+    baseline_metrics["model_group"] = baseline_group
+    metrics.append(baseline_metrics)
+
+    if allow_sarimax and exog_series is not None:
+        sarimax_metrics = _evaluate_sarima_metrics(
+            y_clean, order, seasonal_order, test_window, exog_series=exog_series
+        )
+        sarimax_metrics["model_group"] = "with_regressor"
+        metrics.append(sarimax_metrics)
+
+    if allow_ets_for_reco and baseline_group != "baseline_ets":
+        ets_metrics = _evaluate_ets_metrics(
+            y_clean, test_window, allow_seasonal=allow_ets_seasonal
+        )
+        ets_metrics["model_group"] = "baseline_ets"
+        metrics.append(ets_metrics)
+
+    baseline = next((m for m in metrics if m["model_group"] == baseline_group), None)
+    if baseline is None:
+        return None
+
+    candidates = [m for m in metrics if m["model_group"] != baseline_group]
+    accepted = [m for m in candidates if _accept_candidate(m, baseline)]
+    if not accepted:
+        return baseline_group
+
+    best = min(
+        accepted,
+        key=lambda m: m.get("Test_MAE", np.inf)
+    )
+    return best.get("model_group", baseline_group)
+
+
 def generate_forecast_variants(
     y: pd.Series,
     product_id: str,
@@ -564,6 +830,11 @@ def generate_forecast_variants(
     exog_series: Optional[pd.Series] = None,
     regressor_name: Optional[str] = None,
     regressor_lag: Optional[int] = None,
+    allow_sarima: bool = True,
+    allow_sarimax: bool = True,
+    allow_ets: bool = True,
+    allow_ets_seasonal: bool = True,
+    status_reasons: Optional[Dict[str, str]] = None,
 ) -> pd.DataFrame:
     """
     Build a long-form table of forecasts for:
@@ -574,110 +845,186 @@ def generate_forecast_variants(
     run_id = uuid.uuid4()
     y = y.astype(float)
     dfs = []
+    status_reasons = status_reasons or {}
+
+    def _build_na_rows(
+        model_group: str,
+        model_type: str,
+        model_label: str,
+        reason: str,
+        status: str = "N/A",
+    ) -> pd.DataFrame:
+        include_orders = model_group in {"baseline_sarima", "with_regressor"}
+        df_na = pd.DataFrame({
+            "forecast_month": forecast_index,
+            "forecast_value": [np.nan] * len(forecast_index),
+            "lower_ci": [np.nan] * len(forecast_index),
+            "upper_ci": [np.nan] * len(forecast_index),
+            "model_group": model_group,
+            "model_type": model_type,
+            "model_label": model_label,
+            "p": sarima_order[0] if include_orders else np.nan,
+            "d": sarima_order[1] if include_orders else np.nan,
+            "q": sarima_order[2] if include_orders else np.nan,
+            "P": seasonal_order[0] if include_orders else np.nan,
+            "D": seasonal_order[1] if include_orders else np.nan,
+            "Q": seasonal_order[2] if include_orders else np.nan,
+            "s": seasonal_order[3] if include_orders else np.nan,
+            "regressor_names": None,
+            "regressor_details": None,
+            "model_status": status,
+            "model_status_reason": reason,
+        })
+        return df_na
+
+    def _attach_status(df: pd.DataFrame, status: str, reason: str = "") -> pd.DataFrame:
+        df["model_status"] = status
+        df["model_status_reason"] = reason
+        return df
 
     # Seasonal baseline
-    try:
-        mean, ci = _fit_variant(
-            y_train=y.dropna(),
-            order=sarima_order,
-            seasonal_order=seasonal_order,
-            forecast_index=forecast_index,
-        )
-        sarima_df = pd.DataFrame({
-            "forecast_month": forecast_index,
-            "forecast_value": mean.values,
-            "lower_ci": ci.iloc[:, 0].values,
-            "upper_ci": ci.iloc[:, 1].values,
-            "model_group": "baseline_sarima",
-            "model_type": "SARIMA",
-            "model_label": _natural_model_label("baseline_sarima"),
-            "p": sarima_order[0],
-            "d": sarima_order[1],
-            "q": sarima_order[2],
-            "P": seasonal_order[0],
-            "D": seasonal_order[1],
-            "Q": seasonal_order[2],
-            "s": seasonal_order[3],
-            "regressor_names": None,
-            "regressor_details": None,
-        })
-        dfs.append(_apply_forecast_floor(sarima_df))
-    except Exception as exc:
-        print(f"  Failed SARIMA baseline: {exc}")
+    if not allow_sarima:
+        reason = status_reasons.get("baseline_sarima", "N/A: SARIMA disabled by history threshold.")
+        dfs.append(_build_na_rows("baseline_sarima", "SARIMA", _natural_model_label("baseline_sarima"), reason))
+    else:
+        try:
+            mean, ci = _fit_variant(
+                y_train=y.dropna(),
+                order=sarima_order,
+                seasonal_order=seasonal_order,
+                forecast_index=forecast_index,
+            )
+            sarima_df = pd.DataFrame({
+                "forecast_month": forecast_index,
+                "forecast_value": mean.values,
+                "lower_ci": ci.iloc[:, 0].values,
+                "upper_ci": ci.iloc[:, 1].values,
+                "model_group": "baseline_sarima",
+                "model_type": "SARIMA",
+                "model_label": _natural_model_label("baseline_sarima"),
+                "p": sarima_order[0],
+                "d": sarima_order[1],
+                "q": sarima_order[2],
+                "P": seasonal_order[0],
+                "D": seasonal_order[1],
+                "Q": seasonal_order[2],
+                "s": seasonal_order[3],
+                "regressor_names": None,
+                "regressor_details": None,
+            })
+            dfs.append(_attach_status(_apply_forecast_floor(sarima_df), "ok"))
+        except Exception as exc:
+            print(f"  Failed SARIMA baseline: {exc}")
+            dfs.append(_build_na_rows(
+                "baseline_sarima",
+                "SARIMA",
+                _natural_model_label("baseline_sarima"),
+                f"Failed: {exc}",
+                status="Failed",
+            ))
 
     # ETS baseline (AICc/AIC selection)
-    try:
-        y_train = y.dropna()
-        ets_res, ets_spec, ets_impl = _select_best_ets_model(
-            y_train,
-            context=f" for {product_id}/{bu_id}"
-        )
-        if ets_res is None:
-            raise ValueError("No ETS candidate fit succeeded")
+    if not allow_ets:
+        reason = status_reasons.get("baseline_ets", "N/A: ETS disabled by history threshold.")
+        dfs.append(_build_na_rows("baseline_ets", "ETS", _natural_model_label("baseline_ets"), reason))
+    else:
+        try:
+            y_train = y.dropna()
+            ets_res, ets_spec, ets_impl = _select_best_ets_model(
+                y_train,
+                allow_seasonal=allow_ets_seasonal,
+                context=f" for {product_id}/{bu_id}"
+            )
+            if ets_res is None:
+                raise ValueError("No ETS candidate fit succeeded")
 
-        mean, ci = _forecast_ets(ets_res, forecast_index)
-        ets_df = pd.DataFrame({
-            "forecast_month": forecast_index,
-            "forecast_value": mean.values,
-            "lower_ci": ci.iloc[:, 0].values,
-            "upper_ci": ci.iloc[:, 1].values,
-            "model_group": "baseline_ets",
-            "model_type": "ETS",
-            "model_label": _natural_model_label("baseline_ets"),
-            "p": np.nan,
-            "d": np.nan,
-            "q": np.nan,
-            "P": np.nan,
-            "D": np.nan,
-            "Q": np.nan,
-            "s": np.nan,
-            "regressor_names": None,
-            "regressor_details": None,
-        })
-        dfs.append(_apply_forecast_floor(ets_df))
-    except Exception as exc:
-        print(f"  Failed ETS baseline: {exc}")
+            mean, ci = _forecast_ets(ets_res, forecast_index)
+            ets_df = pd.DataFrame({
+                "forecast_month": forecast_index,
+                "forecast_value": mean.values,
+                "lower_ci": ci.iloc[:, 0].values,
+                "upper_ci": ci.iloc[:, 1].values,
+                "model_group": "baseline_ets",
+                "model_type": "ETS",
+                "model_label": _natural_model_label("baseline_ets"),
+                "p": np.nan,
+                "d": np.nan,
+                "q": np.nan,
+                "P": np.nan,
+                "D": np.nan,
+                "Q": np.nan,
+                "s": np.nan,
+                "regressor_names": None,
+                "regressor_details": None,
+            })
+            dfs.append(_attach_status(_apply_forecast_floor(ets_df), "ok"))
+        except Exception as exc:
+            print(f"  Failed ETS baseline: {exc}")
+            dfs.append(_build_na_rows(
+                "baseline_ets",
+                "ETS",
+                _natural_model_label("baseline_ets"),
+                f"Failed: {exc}",
+                status="Failed",
+            ))
 
     # With regressor (SARIMAX)
-    X_train, X_future = _build_exog_frames(exog_series, forecast_index)
-    if X_train is not None and X_future is not None:
-        aligned = pd.concat([y, X_train], axis=1).dropna()
-        if len(aligned) >= 5:
-            y_train = aligned.iloc[:, 0]
-            exog_train = aligned.iloc[:, 1:]
-            try:
-                mean, ci = _fit_variant(
-                    y_train=y_train,
-                    order=sarima_order,
-                    seasonal_order=seasonal_order,
-                    forecast_index=forecast_index,
-                    exog_train=exog_train,
-                    exog_future=X_future,
-                )
-                regressor_cols = list(exog_train.columns)
-                regressor_name_str = ", ".join(regressor_cols)
-                reg_label = _natural_model_label("with_regressor", regressor_name, regressor_lag)
-                sarimax_df = pd.DataFrame({
-                    "forecast_month": forecast_index,
-                    "forecast_value": mean.values,
-                    "lower_ci": ci.iloc[:, 0].values,
-                    "upper_ci": ci.iloc[:, 1].values,
-                    "model_group": "with_regressor",
-                    "model_type": "SARIMAX",
-                    "model_label": reg_label,
-                    "p": sarima_order[0],
-                    "d": sarima_order[1],
-                    "q": sarima_order[2],
-                    "P": seasonal_order[0],
-                    "D": seasonal_order[1],
-                    "Q": seasonal_order[2],
-                    "s": seasonal_order[3],
-                    "regressor_names": [regressor_name_str] * len(mean),
-                    "regressor_details": None,
-                })
-                dfs.append(_apply_forecast_floor(sarimax_df))
-            except Exception as exc:
-                print(f"  Failed regressor variant: {exc}")
+    if not allow_sarimax:
+        reason = status_reasons.get("with_regressor", "N/A: SARIMAX disabled by history threshold.")
+        reg_label = _natural_model_label("with_regressor", regressor_name, regressor_lag)
+        dfs.append(_build_na_rows("with_regressor", "SARIMAX", reg_label, reason))
+    else:
+        X_train, X_future = _build_exog_frames(exog_series, forecast_index)
+        if X_train is not None and X_future is not None:
+            aligned = pd.concat([y, X_train], axis=1).dropna()
+            if len(aligned) >= 5:
+                y_train = aligned.iloc[:, 0]
+                exog_train = aligned.iloc[:, 1:]
+                try:
+                    mean, ci = _fit_variant(
+                        y_train=y_train,
+                        order=sarima_order,
+                        seasonal_order=seasonal_order,
+                        forecast_index=forecast_index,
+                        exog_train=exog_train,
+                        exog_future=X_future,
+                    )
+                    regressor_cols = list(exog_train.columns)
+                    regressor_name_str = ", ".join(regressor_cols)
+                    reg_label = _natural_model_label("with_regressor", regressor_name, regressor_lag)
+                    sarimax_df = pd.DataFrame({
+                        "forecast_month": forecast_index,
+                        "forecast_value": mean.values,
+                        "lower_ci": ci.iloc[:, 0].values,
+                        "upper_ci": ci.iloc[:, 1].values,
+                        "model_group": "with_regressor",
+                        "model_type": "SARIMAX",
+                        "model_label": reg_label,
+                        "p": sarima_order[0],
+                        "d": sarima_order[1],
+                        "q": sarima_order[2],
+                        "P": seasonal_order[0],
+                        "D": seasonal_order[1],
+                        "Q": seasonal_order[2],
+                        "s": seasonal_order[3],
+                        "regressor_names": [regressor_name_str] * len(mean),
+                        "regressor_details": None,
+                    })
+                    dfs.append(_attach_status(_apply_forecast_floor(sarimax_df), "ok"))
+                except Exception as exc:
+                    print(f"  Failed regressor variant: {exc}")
+                    reg_label = _natural_model_label("with_regressor", regressor_name, regressor_lag)
+                    dfs.append(_build_na_rows(
+                        "with_regressor",
+                        "SARIMAX",
+                        reg_label,
+                        f"Failed: {exc}",
+                        status="Failed",
+                    ))
+        else:
+            reg_label = _natural_model_label("with_regressor", regressor_name, regressor_lag)
+            reason = status_reasons.get("with_regressor", "N/A: missing future exog values.")
+            dfs.append(_build_na_rows("with_regressor", "SARIMAX", reg_label, reason))
 
     if not dfs:
         return pd.DataFrame()
@@ -751,6 +1098,21 @@ def main():
         if pd.isna(last_actual_dt):
             print("  Skipping: no actuals available.")
             continue
+        y_nonnull = y.dropna()
+        history_months = len(y_nonnull)
+        nonzero_mask = y_nonnull != 0
+        first_nonzero_dt = y_nonnull[nonzero_mask].index.min() if nonzero_mask.any() else None
+        if first_nonzero_dt is not None:
+            months_since_first_nonzero = (
+                last_actual_dt.to_period("M") - first_nonzero_dt.to_period("M")
+            ).n
+        else:
+            months_since_first_nonzero = -1
+        allow_sarima = history_months >= 12 and months_since_first_nonzero >= 11
+        allow_sarimax = history_months >= 36 and allow_sarima
+        allow_ets = True
+        allow_ets_seasonal = history_months >= 24
+        allow_ets_for_reco = history_months < 24
 
         freq = y.index.freq or pd.infer_freq(y.index)
         if freq is None:
@@ -762,6 +1124,21 @@ def main():
         # If choice is explicitly baseline, ignore regressors
         if choice.get("model") in {"SARIMA_baseline", "ETS_baseline"}:
             exog_series = None
+        if not allow_sarimax:
+            exog_series = None
+
+        status_reasons = {}
+        if not allow_sarima:
+            status_reasons["baseline_sarima"] = (
+                "N/A: history <12 months or first non-zero actual is <12 months ago."
+            )
+        if not allow_sarimax:
+            if history_months < 36:
+                status_reasons["with_regressor"] = "N/A: history <36 months; SARIMAX disabled."
+            else:
+                status_reasons["with_regressor"] = "N/A: SARIMA prerequisites not met."
+        elif exog_series is None:
+            status_reasons["with_regressor"] = "N/A: no regressor selected or exog unavailable."
 
         fc_df = generate_forecast_variants(
             y=y,
@@ -773,10 +1150,27 @@ def main():
             exog_series=exog_series,
             regressor_name=choice.get("reg_name"),
             regressor_lag=choice.get("reg_lag"),
+            allow_sarima=allow_sarima,
+            allow_sarimax=allow_sarimax,
+            allow_ets=allow_ets,
+            allow_ets_seasonal=allow_ets_seasonal,
+            status_reasons=status_reasons,
         )
         if fc_df.empty:
             print("  No forecasts generated for this SKU (all variants failed).")
             continue
+
+        recommended_group = _recommend_model_group(
+            y=y,
+            order=order,
+            seasonal_order=seasonal_order,
+            exog_series=exog_series,
+            allow_sarima=allow_sarima,
+            allow_sarimax=allow_sarimax,
+            allow_ets_for_reco=allow_ets_for_reco,
+            allow_ets_seasonal=allow_ets_seasonal,
+        )
+        fc_df["recommended_model"] = fc_df["model_group"] == recommended_group
 
         results_rows.append(fc_df)
         print(f"  Generated {fc_df['model_group'].nunique()} model variants.")
