@@ -113,6 +113,35 @@ def generate_rocv_splits(n_obs: int, horizon: int = ROCV_HORIZON, n_splits: int 
     return splits
 
 
+def _safe_mae(y_true: pd.Series, y_pred: pd.Series) -> float:
+    """Compute MAE while ignoring NaNs/Infs."""
+    y_true = pd.Series(y_true).astype(float)
+    y_pred = pd.Series(y_pred).astype(float)
+    mask = np.isfinite(y_true.values) & np.isfinite(y_pred.values)
+    if not mask.any():
+        return np.nan
+    return float(np.mean(np.abs(y_true.values[mask] - y_pred.values[mask])))
+
+
+def _clean_series_and_exog(
+    y: pd.Series,
+    exog: Optional[pd.DataFrame],
+) -> Tuple[pd.Series, Optional[pd.DataFrame]]:
+    """Align and drop rows with missing values in y or exog."""
+    y = pd.to_numeric(pd.Series(y), errors="coerce")
+    if exog is None:
+        return y.dropna(), None
+
+    exog = pd.DataFrame(exog).apply(pd.to_numeric, errors="coerce")
+    df = pd.concat([y.rename("y"), exog], axis=1)
+    df = df.dropna()
+    if df.empty:
+        return pd.Series([], dtype=float), exog.iloc[0:0]
+    y_clean = df["y"]
+    exog_clean = df.drop(columns=["y"])
+    return y_clean, exog_clean
+
+
 # --------------------------------------------------
 # 3. FIT + EVALUATE A SINGLE ORDER
 # --------------------------------------------------
@@ -132,10 +161,14 @@ def evaluate_sarimax_order(
         "BIC": np.nan,
     }
 
+    y_clean, exog_clean = _clean_series_and_exog(y, exog)
+    if len(y_clean) < 3:
+        return results
+
     try:
         model = SARIMAX(
-            y,
-            exog=exog,
+            y_clean,
+            exog=exog_clean,
             order=order,
             seasonal_order=seasonal_order,
             enforce_stationarity=False,
@@ -147,22 +180,22 @@ def evaluate_sarimax_order(
 
     # In-sample fit quality
     fitted = fit_res.fittedvalues
-    y_aligned, fitted_aligned = y.align(fitted, join="inner")
-    in_sample_mae = mean_absolute_error(y_aligned, fitted_aligned)
+    y_aligned, fitted_aligned = y_clean.align(fitted, join="inner")
+    in_sample_mae = _safe_mae(y_aligned, fitted_aligned)
 
     # Information criteria
     aic = fit_res.aic
     bic = fit_res.bic
 
     # Rolling-origin CV
-    n_obs = len(y)
+    n_obs = len(y_clean)
     splits = generate_rocv_splits(n_obs)
     rocv_maes = []
     for train_end, test_end in splits:
-        y_train = y.iloc[:train_end]
-        y_test = y.iloc[train_end:test_end]
-        exog_train = exog.iloc[:train_end, :] if exog is not None else None
-        exog_test = exog.iloc[train_end:test_end, :] if exog is not None else None
+        y_train = y_clean.iloc[:train_end]
+        y_test = y_clean.iloc[train_end:test_end]
+        exog_train = exog_clean.iloc[:train_end, :] if exog_clean is not None else None
+        exog_test = exog_clean.iloc[train_end:test_end, :] if exog_clean is not None else None
 
         try:
             model_cv = SARIMAX(
@@ -175,7 +208,7 @@ def evaluate_sarimax_order(
             )
             fit_cv = model_cv.fit(disp=False, maxiter=200)
             forecast = fit_cv.forecast(steps=len(y_test), exog=exog_test)
-            rocv_maes.append(mean_absolute_error(y_test, forecast))
+            rocv_maes.append(_safe_mae(y_test, forecast))
         except Exception:
             rocv_maes = []
             break
@@ -206,15 +239,16 @@ def evaluate_holdout_horizon(
     min_train: int = MIN_TRAIN_FOR_HOLDOUT,
 ) -> float:
     """Evaluate a single order on a final holdout block."""
-    n_obs = len(y)
+    y_clean, exog_clean = _clean_series_and_exog(y, exog)
+    n_obs = len(y_clean)
     if n_obs <= horizon + min_train:
         return np.nan
 
     train_end = n_obs - horizon
-    y_train = y.iloc[:train_end]
-    y_test = y.iloc[train_end:]
-    exog_train = exog.iloc[:train_end, :] if exog is not None else None
-    exog_test = exog.iloc[train_end:, :] if exog is not None else None
+    y_train = y_clean.iloc[:train_end]
+    y_test = y_clean.iloc[train_end:]
+    exog_train = exog_clean.iloc[:train_end, :] if exog_clean is not None else None
+    exog_test = exog_clean.iloc[train_end:, :] if exog_clean is not None else None
 
     try:
         model = SARIMAX(
@@ -227,7 +261,7 @@ def evaluate_holdout_horizon(
         )
         fit_res = model.fit(disp=False, maxiter=200)
         forecast = fit_res.forecast(steps=horizon, exog=exog_test)
-        holdout_mae = mean_absolute_error(y_test, forecast)
+        holdout_mae = _safe_mae(y_test, forecast)
         return holdout_mae
     except Exception:
         return np.nan
@@ -298,8 +332,9 @@ def run_order_search_for_all_products(
     results_summary = []
     for (prod, div), grp in df.groupby([product_col, division_col]):
         grp = grp.set_index(date_col)
-        y = grp[target_col]
-        exog = grp[exog_cols] if exog_cols is not None else None
+        y_raw = grp[target_col]
+        exog_raw = grp[exog_cols] if exog_cols is not None else None
+        y, exog = _clean_series_and_exog(y_raw, exog_raw)
 
         if len(y) < MIN_SERIES_LENGTH:
             results_summary.append(
@@ -386,4 +421,5 @@ if __name__ == "__main__":
     summary.to_excel("sarimax_order_search_summary.xlsx", index=False)
     print("Saved sarimax_order_search_summary.xlsx")
     elapsed = time.perf_counter() - t0
-    print(f"Total runtime: {elapsed:,.2f} seconds")
+    minutes = elapsed / 60.0
+    print(f"Total runtime: {elapsed:,.2f} seconds ({minutes:,.2f} minutes)")

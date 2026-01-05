@@ -4,7 +4,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 import ast
 import os
-import uuid
+import time
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -13,6 +14,13 @@ from pandas.tseries.frequencies import to_offset
 from statsmodels.tsa.exponential_smoothing.ets import ETSModel
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
+from sklearn.ensemble import GradientBoostingRegressor
+try:
+    from prophet import Prophet
+    PROPHET_AVAILABLE = True
+except Exception:
+    Prophet = None
+    PROPHET_AVAILABLE = False
 
 
 # ===========================
@@ -20,6 +28,8 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 # ===========================
 
 INPUT_FILE = "all_products_with_sf_and_bookings.xlsx"
+REVISED_ACTUALS_FILE = "all_products_with_sf_and_bookings_revised.xlsx"
+REVISED_ACTUALS_SHEET = "Revised Actuals"
 SUMMARY_FILE = "sarima_multi_sku_summary.xlsx"          # chosen model per SKU
 ORDER_FILE = "sarimax_order_search_summary.xlsx"        # chosen (p,d,q)(P,D,Q,s) per SKU
 NOTES_FILE = "Notes.xlsx"                               # manual order overrides
@@ -27,6 +37,8 @@ OUTPUT_FILE_BASE = "stats_model_forecasts.xlsx"
 # If a chosen regressor has lag 0, we fall back to baseline (no exog).
 # If future exogenous values are missing, we do NOT fill; the SKU will fall back to baseline instead.
 FILL_MISSING_FUTURE_EXOG_WITH_LAST = True
+ENABLE_ML_CHALLENGER = True
+ENABLE_PROPHET_CHALLENGER = True
 
 COL_PRODUCT = "Product"
 COL_DIVISION = "Division"
@@ -38,6 +50,8 @@ COL_BOOKINGS = "Bookings"
 
 FORECAST_HORIZON = 12
 FORECAST_FLOOR = 0.0
+ETS_MAX_SCALE_MULTIPLIER = 20.0
+ETS_STABILITY_EPS = 1e-6
 TEST_HORIZON_DEFAULT = 12
 MIN_TEST_WINDOW = 6
 ROCV_HORIZON = 12
@@ -50,6 +64,8 @@ ROCV_TOLERANCE_PCT = 0.10
 MODEL_LABELS = {
     "baseline_sarima": "Seasonal Baseline",
     "baseline_ets": "ETS Baseline",
+    "ml_gbr": "ML GBR",
+    "prophet": "PROPHET",
 }
 
 
@@ -105,6 +121,49 @@ def aggregate_monthly_duplicates(
     return aggregated
 
 
+def mark_prelaunch_actuals_as_missing(
+    df: pd.DataFrame,
+    product_col: str = COL_PRODUCT,
+    division_col: str = COL_DIVISION,
+    date_col: str = COL_DATE,
+    actuals_col: str = COL_ACTUALS,
+    output_excel_path: Optional[str] = None,
+    output_sheet: str = REVISED_ACTUALS_SHEET,
+) -> pd.DataFrame:
+    """
+    Replace pre-launch zeros in Actuals with NaN per Product+Division.
+    Pre-launch is defined as any date before the first positive actual.
+    """
+    df = df.copy()
+    if date_col in df.columns:
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    if actuals_col in df.columns:
+        df[actuals_col] = pd.to_numeric(df[actuals_col], errors="coerce")
+
+    def _apply(group: pd.DataFrame) -> pd.DataFrame:
+        group = group.sort_values(date_col).copy()
+        first_active = group.loc[group[actuals_col] > 0, date_col].min()
+        if pd.isna(first_active):
+            group[actuals_col] = np.nan
+            return group
+        prelaunch_mask = (group[date_col] < first_active) & (group[actuals_col] == 0)
+        group.loc[prelaunch_mask, actuals_col] = np.nan
+        return group
+
+    group_cols = [c for c in [product_col, division_col] if c in df.columns]
+    if group_cols:
+        df = df.groupby(group_cols, dropna=False, group_keys=False).apply(_apply)
+    else:
+        df = _apply(df)
+
+    if output_excel_path:
+        with pd.ExcelWriter(output_excel_path, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name=output_sheet, index=False)
+        print(f"Wrote revised actuals to {output_excel_path} ({output_sheet}).")
+
+    return df
+
+
 def _friendly_regressor_name(reg_name: Optional[str]) -> str:
     """Return a natural-language regressor name."""
     if reg_name is None:
@@ -132,6 +191,27 @@ def _natural_model_label(model_group: str,
         return " ".join([p for p in pieces if p])
 
     return model_group
+
+
+def _model_group_from_choice(choice: dict) -> Optional[str]:
+    """Map the chosen model from the summary file to a forecast model_group."""
+    if not choice:
+        return None
+    model_name = choice.get("model")
+    if not isinstance(model_name, str):
+        return None
+    model_name = model_name.strip()
+    if model_name == "SARIMA_baseline":
+        return "baseline_sarima"
+    if model_name == "ETS_baseline":
+        return "baseline_ets"
+    if model_name.startswith("SARIMAX"):
+        return "with_regressor"
+    if model_name == "ML_GBR":
+        return "ml_gbr"
+    if model_name == "PROPHET":
+        return "prophet"
+    return None
 
 
 def _parse_order_cell(value, expected_len: int) -> Optional[Tuple[int, ...]]:
@@ -286,25 +366,23 @@ def load_model_choices(path: str) -> Dict[Tuple[str, str], dict]:
         if reg_name is None or reg_lag is None:
             reg_name, reg_lag = infer_regressor(str(model_name))
 
-        # Force best non-baseline regressor if available
-        forced_model = model_name
-        forced_reg_name = reg_name
-        forced_reg_lag = reg_lag
-        if isinstance(best_non_model, str) and best_non_model.startswith("SARIMAX"):
-            forced_model = best_non_model
-            forced_reg_name = best_non_reg_name or forced_reg_name
-            forced_reg_lag = best_non_reg_lag or forced_reg_lag
+        # Choose regressor details for the SARIMAX variant without overriding the chosen model.
+        sarimax_reg_name = reg_name
+        sarimax_reg_lag = reg_lag
+        if not (isinstance(model_name, str) and model_name.startswith("SARIMAX")):
+            if isinstance(best_non_model, str) and best_non_model.startswith("SARIMAX"):
+                sarimax_reg_name = best_non_reg_name
+                sarimax_reg_lag = best_non_reg_lag
 
-        # Drop any lag-0 regressor: revert to baseline
-        if forced_reg_lag == 0:
-            forced_model = "SARIMA_baseline"
-            forced_reg_name = None
-            forced_reg_lag = None
+        # Drop any lag-0 regressor: leave model choice untouched
+        if sarimax_reg_lag == 0:
+            sarimax_reg_name = None
+            sarimax_reg_lag = None
 
         choices[(prod, div)] = {
-            "model": str(forced_model),
-            "reg_name": forced_reg_name,
-            "reg_lag": forced_reg_lag,
+            "model": str(model_name),
+            "reg_name": sarimax_reg_name,
+            "reg_lag": sarimax_reg_lag,
             "best_nonbaseline_model": best_non_model,
             "best_nonbaseline_reg_name": best_non_reg_name,
             "best_nonbaseline_reg_lag": best_non_reg_lag,
@@ -364,6 +442,40 @@ def get_exog_series(df: pd.DataFrame, reg_name: Optional[str], reg_lag: Optional
     return df[reg_name].shift(lag)
 
 
+def select_default_regressor(df: pd.DataFrame) -> Tuple[Optional[str], Optional[int], Optional[pd.Series]]:
+    """
+    Pick a reasonable SARIMAX regressor when none was selected.
+    Chooses the candidate with the most usable history.
+    """
+    candidates = [
+        ("New_Opportunities", 1, "New_Opportunities_l1"),
+        ("New_Opportunities", 2, "New_Opportunities_l2"),
+        ("New_Opportunities", 3, "New_Opportunities_l3"),
+        ("Open_Opportunities", 1, "Open_Opportunities_l1"),
+        ("Open_Opportunities", 2, "Open_Opportunities_l2"),
+        ("Open_Opportunities", 3, "Open_Opportunities_l3"),
+        ("Bookings", 1, "Bookings_l1"),
+        ("Bookings", 2, "Bookings_l2"),
+    ]
+
+    best = (None, None, None)
+    best_non_null = 0
+    for reg_name, reg_lag, col in candidates:
+        if col not in df.columns:
+            continue
+        series = pd.to_numeric(df[col], errors="coerce")
+        non_null = int(series.notna().sum())
+        if non_null == 0:
+            continue
+        if series.dropna().nunique() <= 1:
+            continue
+        if non_null > best_non_null:
+            best = (reg_name, reg_lag, df[col])
+            best_non_null = non_null
+
+    return best
+
+
 def _build_exog_frames(exog_series: Optional[pd.Series],
                        forecast_index: pd.DatetimeIndex) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """
@@ -372,6 +484,10 @@ def _build_exog_frames(exog_series: Optional[pd.Series],
     """
     if exog_series is None:
         return None, None
+
+    exog_series = pd.Series(exog_series).copy()
+    exog_series.index = pd.to_datetime(exog_series.index)
+    exog_series.index = exog_series.index.to_period("M").to_timestamp()
 
     X_train = exog_series.to_frame()
     X_train.columns = [exog_series.name or "regressor"]
@@ -403,6 +519,63 @@ def _series_is_nonnegative(y: pd.Series) -> bool:
     return (y_clean >= 0).all()
 
 
+def _ets_reference_scale(y: pd.Series) -> float:
+    """Compute a robust scale for ETS stability checks."""
+    y_clean = pd.Series(y).dropna().astype(float)
+    if y_clean.empty:
+        return 1.0
+
+    recent = y_clean.tail(12)
+    ref = np.nanmedian(np.abs(recent))
+    if not np.isfinite(ref) or ref <= 0:
+        ref = np.nanmedian(np.abs(y_clean))
+    if not np.isfinite(ref) or ref <= 0:
+        ref = np.nanmax(np.abs(y_clean))
+    if not np.isfinite(ref) or ref <= 0:
+        ref = 1.0
+    return float(ref)
+
+
+def _ets_is_stable(res, y_train: pd.Series, steps: int) -> Tuple[bool, str]:
+    """Validate ETS forecasts to avoid unstable or implausible outputs."""
+    try:
+        forecast = res.get_forecast(steps=steps).predicted_mean
+    except Exception:
+        try:
+            forecast = res.forecast(steps=steps)
+        except Exception:
+            return False, "forecast_failed"
+
+    forecast = pd.Series(forecast).astype(float)
+    if not np.isfinite(forecast).all():
+        return False, "forecast_nonfinite"
+
+    ref = _ets_reference_scale(y_train)
+    max_abs = max(ref * ETS_MAX_SCALE_MULTIPLIER, 1.0)
+    lower = -max_abs
+    upper = max_abs
+
+    if _series_is_nonnegative(y_train):
+        if (forecast < -ETS_STABILITY_EPS).any():
+            return False, "forecast_negative"
+        lower = -ETS_STABILITY_EPS
+
+    if (forecast < lower).any() or (forecast > upper).any():
+        return False, "forecast_out_of_range"
+
+    fitted = getattr(res, "fittedvalues", None)
+    if fitted is not None:
+        fitted = pd.Series(fitted).astype(float)
+        if not np.isfinite(fitted).all():
+            return False, "fitted_nonfinite"
+        if _series_is_nonnegative(y_train) and (fitted < -ETS_STABILITY_EPS).any():
+            return False, "fitted_negative"
+        if (fitted < -max_abs).any() or (fitted > max_abs).any():
+            return False, "fitted_out_of_range"
+
+    return True, ""
+
+
 def _ets_candidate_specs(y: pd.Series, allow_seasonal: bool) -> List[dict]:
     """Build a small, industry-standard ETS candidate grid."""
     allow_mul = _series_is_nonnegative(y)
@@ -427,6 +600,81 @@ def _ets_candidate_specs(y: pd.Series, allow_seasonal: bool) -> List[dict]:
                         "seasonal_periods": 12 if seasonal is not None else None,
                     })
     return candidates
+
+
+def _build_ml_features(y: pd.Series) -> pd.DataFrame:
+    """Build ML features from the target series only (no future exog)."""
+    y = pd.Series(y).astype(float)
+    features = pd.DataFrame(index=y.index)
+    features["y_lag1"] = y.shift(1)
+    features["y_lag2"] = y.shift(2)
+    features["y_lag3"] = y.shift(3)
+    if len(y.dropna()) >= 24:
+        features["y_lag12"] = y.shift(12)
+
+    features["month_of_year"] = y.index.month
+    features["trend_index"] = np.arange(len(y))
+    return features
+
+
+def _forecast_ml_recursive(
+    model: GradientBoostingRegressor,
+    y_history: List[float],
+    last_date: pd.Timestamp,
+    horizon: int,
+    feature_columns: List[str],
+) -> pd.Series:
+    """Recursive ML forecast using lagged target + calendar + trend features."""
+    preds = []
+    history = list(y_history)
+    start_trend = len(history)
+    include_lag12 = "y_lag12" in feature_columns
+
+    for step in range(1, horizon + 1):
+        future_date = last_date + pd.DateOffset(months=step)
+        if len(history) < 3 or (include_lag12 and len(history) < 12):
+            raise ValueError("Insufficient history for ML recursive forecast.")
+
+        row = {
+            "y_lag1": history[-1],
+            "y_lag2": history[-2],
+            "y_lag3": history[-3],
+            "month_of_year": future_date.month,
+            "trend_index": start_trend + (step - 1),
+        }
+        if include_lag12:
+            row["y_lag12"] = history[-12]
+
+        X_next = pd.DataFrame([row])[feature_columns]
+        y_next = float(model.predict(X_next)[0])
+        preds.append(y_next)
+        history.append(y_next)
+
+    index = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=horizon, freq="MS")
+    return pd.Series(preds, index=index)
+
+
+def _prepare_prophet_df(y: pd.Series) -> pd.DataFrame:
+    df = pd.DataFrame({
+        "ds": pd.to_datetime(y.index).tz_localize(None),
+        "y": pd.to_numeric(y.values, errors="coerce"),
+    })
+    df = df.dropna(subset=["ds", "y"])
+    df = df.sort_values("ds")
+    df["ds"] = df["ds"].dt.to_period("M").dt.to_timestamp()
+    return df
+
+
+def _coerce_month_start_series(y: pd.Series) -> pd.Series:
+    """Normalize index to month starts without dropping valid month-end data."""
+    y_clean = pd.Series(y).astype(float).dropna()
+    if y_clean.empty:
+        return y_clean
+    idx = pd.to_datetime(y_clean.index).to_period("M").to_timestamp()
+    idx = pd.DatetimeIndex(idx)
+    y_clean.index = idx
+    y_clean = y_clean.groupby(level=0).sum().sort_index()
+    return y_clean
 
 
 def _info_criterion(res) -> float:
@@ -479,6 +727,11 @@ def _select_best_ets_model(y_train: pd.Series, allow_seasonal: bool, context: st
             print(f"[WARN] ETSModel failed ({spec}){context}: {exc}")
             continue
 
+        is_stable, reason = _ets_is_stable(res, y_train, steps=FORECAST_HORIZON)
+        if not is_stable:
+            print(f"[WARN] ETSModel unstable ({spec}){context}: {reason}")
+            continue
+
         if score < best_score:
             best_res = res
             best_spec = spec
@@ -496,6 +749,11 @@ def _select_best_ets_model(y_train: pd.Series, allow_seasonal: bool, context: st
             score = _info_criterion(res)
         except Exception as exc:
             print(f"[WARN] ExponentialSmoothing failed ({spec}){context}: {exc}")
+            continue
+
+        is_stable, reason = _ets_is_stable(res, y_train, steps=FORECAST_HORIZON)
+        if not is_stable:
+            print(f"[WARN] ExponentialSmoothing unstable ({spec}){context}: {reason}")
             continue
 
         if score < best_score:
@@ -538,6 +796,136 @@ def _forecast_ets(res, forecast_index: pd.DatetimeIndex) -> Tuple[pd.Series, pd.
         ci = pd.DataFrame(ci)
         ci.index = forecast_index
     return mean, ci
+
+
+def _evaluate_ml_metrics(
+    y: pd.Series,
+    test_window: int,
+    rocv_horizon: int = ROCV_HORIZON,
+    rocv_max_origins: int = ROCV_MAX_ORIGINS,
+) -> dict:
+    """Fit ML challenger, compute test MAE/RMSE and ROCV MAE."""
+    y_clean = y.dropna().astype(float)
+    if len(y_clean) <= test_window:
+        return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
+
+    features = _build_ml_features(y_clean)
+    df_ml = pd.concat([features, y_clean.rename("y")], axis=1).dropna()
+    if len(df_ml) <= test_window + 5:
+        return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
+
+    train_end = len(df_ml) - test_window
+    train = df_ml.iloc[:train_end]
+    test = df_ml.iloc[train_end:]
+
+    try:
+        model = GradientBoostingRegressor(random_state=42)
+        model.fit(train.drop(columns=["y"]), train["y"])
+        preds = model.predict(test.drop(columns=["y"]))
+    except Exception:
+        return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
+
+    test_mae = _safe_mae(test["y"].values, preds)
+    test_rmse = _safe_rmse(test["y"].values, preds)
+
+    rocv_maes = []
+    min_train = max(12, rocv_horizon)
+    origins = _rocv_origins(len(df_ml), rocv_horizon, rocv_max_origins, min_train)
+    for origin in origins:
+        train_rocv = df_ml.iloc[:origin]
+        try:
+            model_rocv = GradientBoostingRegressor(random_state=42)
+            model_rocv.fit(train_rocv.drop(columns=["y"]), train_rocv["y"])
+            y_history = list(train_rocv["y"].values)
+            last_dt = train_rocv.index.max()
+            feature_columns = list(train_rocv.drop(columns=["y"]).columns)
+            fc = _forecast_ml_recursive(
+                model=model_rocv,
+                y_history=y_history,
+                last_date=last_dt,
+                horizon=rocv_horizon,
+                feature_columns=feature_columns,
+            )
+            y_test_rocv = df_ml.iloc[origin:origin + rocv_horizon]["y"]
+            mae = _safe_mae(y_test_rocv.values, fc.values)
+            if np.isfinite(mae):
+                rocv_maes.append(mae)
+        except Exception:
+            continue
+
+    rocv_mae = float(np.mean(rocv_maes)) if rocv_maes else np.nan
+    return {"Test_MAE": test_mae, "Test_RMSE": test_rmse, "ROCV_MAE": rocv_mae}
+
+
+def _evaluate_prophet_metrics(
+    y: pd.Series,
+    test_window: int,
+    rocv_horizon: int = ROCV_HORIZON,
+    rocv_max_origins: int = ROCV_MAX_ORIGINS,
+) -> dict:
+    """Fit Prophet challenger, compute test MAE/RMSE and ROCV MAE."""
+    if not PROPHET_AVAILABLE:
+        return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
+
+    y_clean = _coerce_month_start_series(y)
+    if len(y_clean) < 24:
+        return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
+    if len(y_clean) <= test_window:
+        return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
+
+    y_train = y_clean.iloc[:-test_window]
+    y_test = y_clean.iloc[-test_window:]
+
+    try:
+        train_df = _prepare_prophet_df(y_train)
+        model = Prophet(
+            yearly_seasonality=True,
+            weekly_seasonality=False,
+            daily_seasonality=False,
+            seasonality_mode="additive",
+            changepoint_prior_scale=0.05,
+        )
+        model.fit(train_df)
+        future_df = pd.DataFrame({"ds": y_test.index})
+        future_df["ds"] = pd.to_datetime(future_df["ds"]).dt.tz_localize(None)
+        future_df["ds"] = future_df["ds"].dt.to_period("M").dt.to_timestamp()
+        forecast = model.predict(future_df)
+        y_pred = pd.Series(forecast["yhat"].values, index=y_test.index)
+    except Exception:
+        return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
+
+    test_mae = _safe_mae(y_test.values, y_pred.values)
+    test_rmse = _safe_rmse(y_test.values, y_pred.values)
+
+    rocv_maes = []
+    min_train = max(24, rocv_horizon)
+    origins = _rocv_origins(len(y_clean), rocv_horizon, rocv_max_origins, min_train)
+    for origin in origins:
+        y_train_rocv = y_clean.iloc[:origin]
+        y_test_rocv = y_clean.iloc[origin:origin + rocv_horizon]
+        try:
+            train_df = _prepare_prophet_df(y_train_rocv)
+            model = Prophet(
+                yearly_seasonality=True,
+                weekly_seasonality=False,
+                daily_seasonality=False,
+                seasonality_mode="additive",
+                changepoint_prior_scale=0.05,
+            )
+            model.fit(train_df)
+            future_df = pd.DataFrame({"ds": y_test_rocv.index})
+            future_df["ds"] = pd.to_datetime(future_df["ds"]).dt.tz_localize(None)
+            future_df["ds"] = future_df["ds"].dt.to_period("M").dt.to_timestamp()
+            forecast = model.predict(future_df)
+            preds = pd.Series(forecast["yhat"].values, index=y_test_rocv.index)
+            mae = _safe_mae(y_test_rocv.values, preds.values)
+            if np.isfinite(mae):
+                rocv_maes.append(mae)
+        except Exception:
+            continue
+
+    rocv_mae = float(np.mean(rocv_maes)) if rocv_maes else np.nan
+    return {"Test_MAE": test_mae, "Test_RMSE": test_rmse, "ROCV_MAE": rocv_mae}
 
 
 def _fit_variant(y_train: pd.Series,
@@ -767,6 +1155,8 @@ def _recommend_model_group(
     allow_sarimax: bool,
     allow_ets_for_reco: bool,
     allow_ets_seasonal: bool,
+    allow_ml: bool,
+    allow_prophet: bool,
 ) -> Optional[str]:
     """Recommend a model group per SKU based on Test and ROCV metrics."""
     y_clean = y.dropna().astype(float)
@@ -804,6 +1194,20 @@ def _recommend_model_group(
         ets_metrics["model_group"] = "baseline_ets"
         metrics.append(ets_metrics)
 
+    if allow_ml:
+        ml_metrics = _evaluate_ml_metrics(
+            y_clean, test_window
+        )
+        ml_metrics["model_group"] = "ml_gbr"
+        metrics.append(ml_metrics)
+
+    if allow_prophet:
+        prophet_metrics = _evaluate_prophet_metrics(
+            y_clean, test_window
+        )
+        prophet_metrics["model_group"] = "prophet"
+        metrics.append(prophet_metrics)
+
     baseline = next((m for m in metrics if m["model_group"] == baseline_group), None)
     if baseline is None:
         return None
@@ -834,6 +1238,8 @@ def generate_forecast_variants(
     allow_sarimax: bool = True,
     allow_ets: bool = True,
     allow_ets_seasonal: bool = True,
+    allow_ml: bool = True,
+    allow_prophet: bool = True,
     status_reasons: Optional[Dict[str, str]] = None,
 ) -> pd.DataFrame:
     """
@@ -842,8 +1248,15 @@ def generate_forecast_variants(
     - ETS baseline (selected by AICc/AIC over a small candidate grid)
     - SARIMAX with regressor (if provided and future exog is available)
     """
-    run_id = uuid.uuid4()
-    y = y.astype(float)
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    y = pd.Series(y).astype(float)
+    y.index = pd.to_datetime(y.index)
+    y.index = y.index.to_period("M").to_timestamp()
+    y = y.sort_index()
+
+    forecast_index = pd.to_datetime(forecast_index)
+    forecast_index = forecast_index.to_period("M").to_timestamp()
+    forecast_index = pd.DatetimeIndex(forecast_index).sort_values()
     dfs = []
     status_reasons = status_reasons or {}
 
@@ -1026,6 +1439,115 @@ def generate_forecast_variants(
             reason = status_reasons.get("with_regressor", "N/A: missing future exog values.")
             dfs.append(_build_na_rows("with_regressor", "SARIMAX", reg_label, reason))
 
+    # ML challenger (GradientBoostingRegressor)
+    if allow_ml:
+        try:
+            y_train = y.dropna()
+            features = _build_ml_features(y_train)
+            df_ml = pd.concat([features, y_train.rename("y")], axis=1).dropna()
+            if len(df_ml) <= 5:
+                raise ValueError("Insufficient ML rows after dropping NaNs.")
+
+            model = GradientBoostingRegressor(random_state=42)
+            model.fit(df_ml.drop(columns=["y"]), df_ml["y"])
+            feature_columns = list(df_ml.drop(columns=["y"]).columns)
+            y_history = list(y_train.values)
+            mean = _forecast_ml_recursive(
+                model=model,
+                y_history=y_history,
+                last_date=y_train.index.max(),
+                horizon=len(forecast_index),
+                feature_columns=feature_columns,
+            )
+            ml_df = pd.DataFrame({
+                "forecast_month": forecast_index,
+                "forecast_value": mean.values,
+                "lower_ci": [np.nan] * len(forecast_index),
+                "upper_ci": [np.nan] * len(forecast_index),
+                "model_group": "ml_gbr",
+                "model_type": "ML",
+                "model_label": _natural_model_label("ml_gbr"),
+                "p": np.nan,
+                "d": np.nan,
+                "q": np.nan,
+                "P": np.nan,
+                "D": np.nan,
+                "Q": np.nan,
+                "s": np.nan,
+                "regressor_names": None,
+                "regressor_details": None,
+            })
+            dfs.append(_attach_status(_apply_forecast_floor(ml_df), "ok"))
+        except Exception as exc:
+            reason = status_reasons.get("ml_gbr", f"Failed: {exc}")
+            dfs.append(_build_na_rows(
+                "ml_gbr",
+                "ML",
+                _natural_model_label("ml_gbr"),
+                reason,
+                status="Failed",
+            ))
+
+    # Prophet challenger
+    if allow_prophet:
+        if not PROPHET_AVAILABLE:
+            reason = status_reasons.get("prophet", "N/A: Prophet not installed.")
+            dfs.append(_build_na_rows(
+                "prophet",
+                "PROPHET",
+                _natural_model_label("prophet"),
+                reason,
+            ))
+        else:
+            try:
+                y_train = _coerce_month_start_series(y)
+                if len(y_train) < 24:
+                    raise ValueError("Insufficient history (<24 months).")
+
+                train_df = _prepare_prophet_df(y_train)
+                model = Prophet(
+                    yearly_seasonality=True,
+                    weekly_seasonality=False,
+                    daily_seasonality=False,
+                    seasonality_mode="additive",
+                    changepoint_prior_scale=0.05,
+                )
+                model.fit(train_df)
+                future_df = pd.DataFrame({"ds": forecast_index})
+                future_df["ds"] = pd.to_datetime(future_df["ds"]).dt.tz_localize(None)
+                future_df["ds"] = future_df["ds"].dt.to_period("M").dt.to_timestamp()
+                forecast = model.predict(future_df)
+                mean = pd.Series(forecast["yhat"].values, index=forecast_index)
+
+                prophet_df = pd.DataFrame({
+                    "forecast_month": forecast_index,
+                    "forecast_value": mean.values,
+                    "lower_ci": [np.nan] * len(forecast_index),
+                    "upper_ci": [np.nan] * len(forecast_index),
+                    "model_group": "prophet",
+                    "model_type": "PROPHET",
+                    "model_label": _natural_model_label("prophet"),
+                    "p": np.nan,
+                    "d": np.nan,
+                    "q": np.nan,
+                    "P": np.nan,
+                    "D": np.nan,
+                    "Q": np.nan,
+                    "s": np.nan,
+                    "regressor_names": None,
+                    "regressor_details": None,
+                })
+                dfs.append(_attach_status(_apply_forecast_floor(prophet_df), "ok"))
+            except Exception as exc:
+                reason = status_reasons.get("prophet", f"Failed: {exc}")
+                dfs.append(_build_na_rows(
+                    "prophet",
+                    "PROPHET",
+                    _natural_model_label("prophet"),
+                    reason,
+                    status="Failed",
+                ))
+
     if not dfs:
         return pd.DataFrame()
 
@@ -1060,10 +1582,34 @@ def _apply_forecast_floor(df: pd.DataFrame, floor: float = FORECAST_FLOOR) -> pd
 # MAIN
 # ===========================
 
+def _print_total_runtime(start_time: float) -> None:
+    """Print elapsed runtime in seconds and minutes."""
+    elapsed = time.perf_counter() - start_time
+    minutes = elapsed / 60.0
+    print(f"Total runtime: {elapsed:,.2f} seconds ({minutes:,.2f} minutes)")
+
+
 def main():
+    if ENABLE_ML_CHALLENGER:
+        print("ML challenger enabled — evaluating ML_GBR candidate.")
+    else:
+        print("ML challenger disabled (ENABLE_ML_CHALLENGER=False) — skipping ML candidate evaluation.")
+    if ENABLE_PROPHET_CHALLENGER:
+        if PROPHET_AVAILABLE:
+            print("Prophet challenger enabled — evaluating PROPHET candidate.")
+        else:
+            print("Prophet not installed; skipping Prophet challenger.")
+    else:
+        print("Prophet challenger disabled (ENABLE_PROPHET_CHALLENGER=False) — skipping Prophet candidate evaluation.")
+
     print("Loading data...")
     df_all = pd.read_excel(INPUT_FILE)
     df_all = aggregate_monthly_duplicates(df_all)
+    df_all = mark_prelaunch_actuals_as_missing(
+        df_all,
+        output_excel_path=REVISED_ACTUALS_FILE,
+        output_sheet=REVISED_ACTUALS_SHEET,
+    )
     df_all[COL_DATE] = pd.to_datetime(df_all[COL_DATE])
     df_all = df_all.sort_values([COL_PRODUCT, COL_DIVISION, COL_DATE])
 
@@ -1120,10 +1666,11 @@ def main():
         freq = to_offset(freq)
         forecast_index = pd.date_range(start=last_actual_dt + freq, periods=FORECAST_HORIZON, freq=freq)
 
-        exog_series = get_exog_series(df_features, choice.get("reg_name"), choice.get("reg_lag"))
-        # If choice is explicitly baseline, ignore regressors
-        if choice.get("model") in {"SARIMA_baseline", "ETS_baseline"}:
-            exog_series = None
+        reg_name = choice.get("reg_name")
+        reg_lag = choice.get("reg_lag")
+        exog_series = get_exog_series(df_features, reg_name, reg_lag)
+        if allow_sarimax and exog_series is None:
+            reg_name, reg_lag, exog_series = select_default_regressor(df_features)
         if not allow_sarimax:
             exog_series = None
 
@@ -1140,6 +1687,16 @@ def main():
         elif exog_series is None:
             status_reasons["with_regressor"] = "N/A: no regressor selected or exog unavailable."
 
+        allow_ml = ENABLE_ML_CHALLENGER
+        if not allow_ml:
+            status_reasons["ml_gbr"] = "N/A: ML challenger disabled."
+
+        allow_prophet = ENABLE_PROPHET_CHALLENGER and PROPHET_AVAILABLE
+        if not ENABLE_PROPHET_CHALLENGER:
+            status_reasons["prophet"] = "N/A: Prophet challenger disabled."
+        elif not PROPHET_AVAILABLE:
+            status_reasons["prophet"] = "N/A: Prophet not installed."
+
         fc_df = generate_forecast_variants(
             y=y,
             product_id=prod,
@@ -1148,28 +1705,21 @@ def main():
             seasonal_order=seasonal_order,
             forecast_index=forecast_index,
             exog_series=exog_series,
-            regressor_name=choice.get("reg_name"),
-            regressor_lag=choice.get("reg_lag"),
+            regressor_name=reg_name,
+            regressor_lag=reg_lag,
             allow_sarima=allow_sarima,
             allow_sarimax=allow_sarimax,
             allow_ets=allow_ets,
             allow_ets_seasonal=allow_ets_seasonal,
+            allow_ml=allow_ml,
+            allow_prophet=allow_prophet,
             status_reasons=status_reasons,
         )
         if fc_df.empty:
             print("  No forecasts generated for this SKU (all variants failed).")
             continue
 
-        recommended_group = _recommend_model_group(
-            y=y,
-            order=order,
-            seasonal_order=seasonal_order,
-            exog_series=exog_series,
-            allow_sarima=allow_sarima,
-            allow_sarimax=allow_sarimax,
-            allow_ets_for_reco=allow_ets_for_reco,
-            allow_ets_seasonal=allow_ets_seasonal,
-        )
+        recommended_group = _model_group_from_choice(choice)
         fc_df["recommended_model"] = fc_df["model_group"] == recommended_group
 
         results_rows.append(fc_df)
@@ -1180,10 +1730,6 @@ def main():
         return
 
     all_forecasts = pd.concat(results_rows, axis=0, ignore_index=True)
-    # Keep original SKU identifiers alongside normalized columns
-    all_forecasts[COL_PRODUCT] = all_forecasts["product_id"]
-    all_forecasts[COL_DIVISION] = all_forecasts["bu_id"]
-
     # Format forecast_month for Excel as MM/DD/YYYY to avoid time components
     all_forecasts["forecast_month"] = pd.to_datetime(all_forecasts["forecast_month"]).dt.strftime("%m/%d/%Y")
 
@@ -1192,7 +1738,7 @@ def main():
     key_col = (
         all_forecasts["product_id"].astype(str)
         + "|"
-        + all_forecasts[COL_DIVISION].astype(str)
+        + all_forecasts["bu_id"].astype(str)
         + "|"
         + fc_month_short.astype(str)
         + "|"
@@ -1208,4 +1754,6 @@ def main():
 
 
 if __name__ == "__main__":
+    start_time = time.perf_counter()
     main()
+    _print_total_runtime(start_time)

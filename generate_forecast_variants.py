@@ -1,4 +1,4 @@
-import uuid
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 from statsmodels.tsa.exponential_smoothing.ets import ETSModel
@@ -22,7 +22,7 @@ def generate_forecast_variants(
     SARIMA baseline, ETS baseline, and SARIMAX-with-regressor (if exog provided).
     """
 
-    run_id = uuid.uuid4()
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
     # ---------------------------
     # 1) SARIMA baseline

@@ -6,21 +6,33 @@ import ast
 import os
 import time
 from typing import List, Optional
+import argparse
 import numpy as np
 import pandas as pd
 from statsmodels.tsa.exponential_smoothing.ets import ETSModel
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.ensemble import GradientBoostingRegressor
+try:
+    from prophet import Prophet
+    PROPHET_AVAILABLE = True
+except Exception:
+    Prophet = None
+    PROPHET_AVAILABLE = False
 
 # ===========================
 # 1. CONFIG
 # ===========================
 
 INPUT_FILE = "all_products_with_sf_and_bookings.xlsx"  # <--- change to your file
+REVISED_ACTUALS_FILE = "all_products_with_sf_and_bookings_revised.xlsx"
+REVISED_ACTUALS_SHEET = "Revised Actuals"
 OUTPUT_FILE = "sarima_multi_sku_summary.xlsx"
 ORDER_FILE = "sarimax_order_search_summary.xlsx"       # per-SKU SARIMA orders
 NOTES_FILE = "Notes.xlsx"                              # manual order overrides
+ENABLE_ML_CHALLENGER = True
+ENABLE_PROPHET_CHALLENGER = True
 
 # Column names – adjust if your master file uses different names
 COL_PRODUCT = "Product"
@@ -47,6 +59,13 @@ ETS_SEASONAL_PERIODS = 12     # monthly data
 # ===========================
 # 2. HELPER FUNCTIONS
 # ===========================
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Multi-SKU SARIMA/SARIMAX/ETS/ML evaluation engine")
+    parser.add_argument("--disable-ml", action="store_true", help="Disable ML challenger evaluation")
+    parser.add_argument("--disable-prophet", action="store_true", help="Disable Prophet challenger evaluation")
+    return parser.parse_args()
+
 
 def aggregate_monthly_duplicates(
     df: pd.DataFrame,
@@ -82,6 +101,49 @@ def aggregate_monthly_duplicates(
     return aggregated
 
 
+def mark_prelaunch_actuals_as_missing(
+    df: pd.DataFrame,
+    product_col: str = COL_PRODUCT,
+    division_col: str = COL_DIVISION,
+    date_col: str = COL_DATE,
+    actuals_col: str = COL_ACTUALS,
+    output_excel_path: Optional[str] = None,
+    output_sheet: str = REVISED_ACTUALS_SHEET,
+) -> pd.DataFrame:
+    """
+    Replace pre-launch zeros in Actuals with NaN per Product+Division.
+    Pre-launch is defined as any date before the first positive actual.
+    """
+    df = df.copy()
+    if date_col in df.columns:
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    if actuals_col in df.columns:
+        df[actuals_col] = pd.to_numeric(df[actuals_col], errors="coerce")
+
+    def _apply(group: pd.DataFrame) -> pd.DataFrame:
+        group = group.sort_values(date_col).copy()
+        first_active = group.loc[group[actuals_col] > 0, date_col].min()
+        if pd.isna(first_active):
+            group[actuals_col] = np.nan
+            return group
+        prelaunch_mask = (group[date_col] < first_active) & (group[actuals_col] == 0)
+        group.loc[prelaunch_mask, actuals_col] = np.nan
+        return group
+
+    group_cols = [c for c in [product_col, division_col] if c in df.columns]
+    if group_cols:
+        df = df.groupby(group_cols, dropna=False, group_keys=False).apply(_apply)
+    else:
+        df = _apply(df)
+
+    if output_excel_path:
+        with pd.ExcelWriter(output_excel_path, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name=output_sheet, index=False)
+        print(f"Wrote revised actuals to {output_excel_path} ({output_sheet}).")
+
+    return df
+
+
 def safe_mae(y_true, y_pred):
     """Compute MAE robustly."""
     y_true = np.asarray(y_true)
@@ -101,6 +163,13 @@ def safe_rmse(y_true, y_pred):
         return np.nan
     mse = mean_squared_error(y_true[mask], y_pred[mask])  # no squared arg
     return np.sqrt(mse)
+
+
+def _compute_test_window(history_months: int) -> int:
+    """Match forecast script: smaller test windows for short histories."""
+    if history_months < 24:
+        return min(TEST_HORIZON, max(6, int(np.floor(0.25 * history_months))))
+    return TEST_HORIZON
 
 
 def _regressor_failure_metrics(model_name):
@@ -350,6 +419,200 @@ def rolling_origin_cv_ets_precomputed(rocv_spec, ets_spec, impl, horizon=ROCV_HO
     return float(np.mean(errors))
 
 
+def build_ml_features(df_sku: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build ML features for a single SKU.
+    Features are lagged target, calendar, and optional historical exogenous fields.
+    """
+    df = df_sku.copy()
+    y = df[COL_ACTUALS].astype(float)
+
+    features = pd.DataFrame(index=df.index)
+    features["y_lag1"] = y.shift(1)
+    features["y_lag2"] = y.shift(2)
+    features["y_lag3"] = y.shift(3)
+    if len(y.dropna()) >= 24:
+        features["y_lag12"] = y.shift(12)
+
+    features["month_of_year"] = features.index.month
+    features["trend_index"] = np.arange(len(features))
+
+    # Optional exogenous features (historical only)
+    if "New_Quotes" in df.columns:
+        features["New_Quotes_l0"] = pd.to_numeric(df["New_Quotes"], errors="coerce")
+        features["New_Quotes_l1"] = pd.to_numeric(df["New_Quotes"], errors="coerce").shift(1)
+    if COL_OPEN_OPPS in df.columns:
+        features["Open_Opportunities_l0"] = pd.to_numeric(df[COL_OPEN_OPPS], errors="coerce")
+    if COL_BOOKINGS in df.columns:
+        features["Bookings_l0"] = pd.to_numeric(df[COL_BOOKINGS], errors="coerce")
+        features["Bookings_l1"] = pd.to_numeric(df[COL_BOOKINGS], errors="coerce").shift(1)
+
+    return features
+
+
+def _ml_exog_columns(columns: List[str]) -> List[str]:
+    prefixes = ("New_Quotes", "Open_Opportunities", "Bookings")
+    return [c for c in columns if c.startswith(prefixes)]
+
+
+def forecast_ml_recursive(
+    model: GradientBoostingRegressor,
+    y_history: List[float],
+    last_date: pd.Timestamp,
+    horizon: int,
+    feature_columns: List[str],
+) -> pd.Series:
+    """
+    Recursive ML forecast using only lagged target + calendar + trend features.
+    """
+    preds = []
+    history = list(y_history)
+    start_trend = len(history)
+    include_lag12 = "y_lag12" in feature_columns
+
+    for step in range(1, horizon + 1):
+        future_date = last_date + pd.DateOffset(months=step)
+        month_of_year = future_date.month
+        trend_index = start_trend + (step - 1)
+
+        if len(history) < 3 or (include_lag12 and len(history) < 12):
+            raise ValueError("Insufficient history for recursive ML forecast.")
+
+        row = {
+            "y_lag1": history[-1],
+            "y_lag2": history[-2],
+            "y_lag3": history[-3],
+            "month_of_year": month_of_year,
+            "trend_index": trend_index,
+        }
+        if include_lag12:
+            row["y_lag12"] = history[-12]
+
+        X_next = pd.DataFrame([row])[feature_columns]
+        y_next = float(model.predict(X_next)[0])
+        preds.append(y_next)
+        history.append(y_next)
+
+    index = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=horizon, freq="MS")
+    return pd.Series(preds, index=index)
+
+
+def rolling_origin_cv_ml(
+    df_sku: pd.DataFrame,
+    min_obs: int = ROCV_MIN_OBS,
+    horizon: int = ROCV_HORIZON,
+):
+    """Rolling-origin CV for ML, rebuilding features up to each origin."""
+    y = df_sku[COL_ACTUALS].astype(float)
+    base_features = build_ml_features(df_sku)
+    df_ml_full = pd.concat([base_features, y.rename("y")], axis=1).dropna()
+    if len(df_ml_full) < min_obs + horizon:
+        return np.nan, "Insufficient rows for ROCV."
+
+    errors = []
+    for origin in range(min_obs, len(df_ml_full) - horizon + 1):
+        cutoff_idx = df_ml_full.index[origin + horizon - 1]
+        df_subset = df_sku.loc[:cutoff_idx]
+        features_subset = build_ml_features(df_subset)
+        df_ml_subset = pd.concat(
+            [features_subset, df_subset[COL_ACTUALS].astype(float).rename("y")],
+            axis=1
+        ).dropna()
+        if len(df_ml_subset) < origin + horizon:
+            continue
+
+        train = df_ml_subset.iloc[:origin]
+        test = df_ml_subset.iloc[origin:origin + horizon]
+        try:
+            model = GradientBoostingRegressor(random_state=42)
+            model.fit(train.drop(columns=["y"]), train["y"])
+            preds = model.predict(test.drop(columns=["y"]))
+            err = safe_mae(test["y"].values, preds)
+            if not np.isnan(err):
+                errors.append(err)
+        except Exception:
+            continue
+
+    if not errors:
+        return np.nan, "No valid ROCV origins."
+    return float(np.mean(errors)), ""
+
+
+def evaluate_ml_candidate(
+    df_sku: pd.DataFrame,
+    horizon: int = TEST_HORIZON,
+):
+    """
+    Fit ML challenger and return metrics + skip reasons (if any).
+    """
+    y = df_sku[COL_ACTUALS].astype(float)
+    features = build_ml_features(df_sku)
+    df_ml = pd.concat([features, y.rename("y")], axis=1).dropna()
+
+    metrics = {
+        "Model": "ML_GBR",
+        "Test_MAE": np.nan,
+        "Test_RMSE": np.nan,
+        "AIC": np.nan,
+        "BIC": np.nan,
+        "ROCV_MAE": np.nan,
+        "Regressor_coef": np.nan,
+        "Regressor_pvalue": np.nan,
+        "Skip_Reason": "",
+        "Requires_Future_Exog": False,
+        "Forecast_valid": False,
+    }
+
+    if len(df_ml) <= horizon + 5:
+        metrics["Skip_Reason"] = "Insufficient ML rows after dropping NaNs."
+        return metrics
+
+    train_end = len(df_ml) - horizon
+    train = df_ml.iloc[:train_end]
+    test = df_ml.iloc[train_end:]
+
+    exog_cols = _ml_exog_columns(list(train.columns))
+    if exog_cols:
+        metrics["Requires_Future_Exog"] = True
+
+    try:
+        model = GradientBoostingRegressor(random_state=42)
+        model.fit(train.drop(columns=["y"]), train["y"])
+        preds = model.predict(test.drop(columns=["y"]))
+    except Exception as exc:
+        metrics["Skip_Reason"] = f"ML fit failed: {exc}"
+        return metrics
+
+    metrics["Test_MAE"] = safe_mae(test["y"].values, preds)
+    metrics["Test_RMSE"] = safe_rmse(test["y"].values, preds)
+
+    rocv_mae, rocv_reason = rolling_origin_cv_ml(df_sku)
+    metrics["ROCV_MAE"] = rocv_mae
+    if rocv_reason and not metrics["Skip_Reason"]:
+        metrics["Skip_Reason"] = rocv_reason
+
+    if not metrics["Requires_Future_Exog"]:
+        try:
+            y_history = list(y.dropna().astype(float).values)
+            if y_history:
+                feature_columns = list(train.drop(columns=["y"]).columns)
+                fc = forecast_ml_recursive(
+                    model=model,
+                    y_history=y_history,
+                    last_date=y.dropna().index.max(),
+                    horizon=horizon,
+                    feature_columns=feature_columns,
+                )
+                metrics["Forecast_valid"] = (len(fc) == horizon and np.isfinite(fc.values).all())
+        except Exception as exc:
+            metrics["Skip_Reason"] = metrics["Skip_Reason"] or f"ML forecast failed: {exc}"
+
+    if metrics["Requires_Future_Exog"] and not metrics["Skip_Reason"]:
+        metrics["Skip_Reason"] = "ML uses exogenous features; future exog not allowed for recommendation."
+
+    return metrics
+
+
 def fit_sarima_baseline(y_train, order, seasonal_order):
     """Fit baseline SARIMA model without exogenous regressors."""
     model = SARIMAX(
@@ -579,9 +842,10 @@ def evaluate_ets_model(
     compute ROCV MAE, and return a dict of metrics.
     """
     y = pd.Series(y).astype(float)
-    n_total = len(y)
+    y_clean = y.dropna()
+    n_total = len(y_clean)
 
-    if n_total <= horizon + 5:
+    if n_total <= horizon:
         return {
             "Model": model_name,
             "Test_MAE": np.nan,
@@ -594,8 +858,8 @@ def evaluate_ets_model(
         }
 
     train_end = n_total - horizon
-    y_train = y.iloc[:train_end]
-    y_test = y.iloc[train_end:]
+    y_train = y_clean.iloc[:train_end]
+    y_test = y_clean.iloc[train_end:]
 
     context = f" for {sku}/{bu}" if sku or bu else ""
     ets_res, ets_spec, ets_impl = _select_best_ets_model(y_train, context=context)
@@ -631,6 +895,159 @@ def evaluate_ets_model(
         "Regressor_coef": np.nan,
         "Regressor_pvalue": np.nan
     }
+
+
+def _prepare_prophet_df(y_series: pd.Series) -> pd.DataFrame:
+    df = pd.DataFrame({
+        "ds": pd.to_datetime(y_series.index).tz_localize(None),
+        "y": pd.to_numeric(y_series.values, errors="coerce"),
+    })
+    df = df.dropna(subset=["ds", "y"])
+    df = df.sort_values("ds")
+    df["ds"] = df["ds"].dt.to_period("M").dt.to_timestamp()
+    return df
+
+
+def _coerce_month_start_series(y_series: pd.Series) -> pd.Series:
+    """Normalize index to month starts without dropping valid month-end data."""
+    y_clean = pd.Series(y_series).astype(float).dropna()
+    if y_clean.empty:
+        return y_clean
+    idx = pd.to_datetime(y_clean.index).to_period("M").to_timestamp()
+    idx = pd.DatetimeIndex(idx)
+    y_clean.index = idx
+    y_clean = y_clean.groupby(level=0).sum().sort_index()
+    return y_clean
+
+
+def _evaluate_prophet_metrics(y_series, horizon=TEST_HORIZON, sku=None, bu=None):
+    metrics = {
+        "Model": "PROPHET",
+        "Test_MAE": np.nan,
+        "Test_RMSE": np.nan,
+        "AIC": np.nan,
+        "BIC": np.nan,
+        "ROCV_MAE": np.nan,
+        "Regressor_coef": np.nan,
+        "Regressor_pvalue": np.nan,
+        "Skip_Reason": "",
+        "Forecast_valid": False,
+    }
+
+    if not PROPHET_AVAILABLE:
+        metrics["Skip_Reason"] = "Prophet not installed."
+        return metrics
+
+    y_clean = _coerce_month_start_series(y_series)
+    if len(y_clean) < 24:
+        metrics["Skip_Reason"] = "Insufficient history (<24 months)."
+        return metrics
+
+    if len(y_clean) <= horizon + 5:
+        metrics["Skip_Reason"] = "Insufficient history after holdout."
+        return metrics
+
+    train_end = len(y_clean) - horizon
+    y_train = y_clean.iloc[:train_end]
+    y_test = y_clean.iloc[train_end:]
+
+    try:
+        train_df = _prepare_prophet_df(y_train)
+        if train_df.empty:
+            metrics["Skip_Reason"] = "No usable Prophet training data."
+            return metrics
+
+        model = Prophet(
+            yearly_seasonality=True,
+            weekly_seasonality=False,
+            daily_seasonality=False,
+            seasonality_mode="additive",
+            changepoint_prior_scale=0.05,
+        )
+        model.fit(train_df)
+
+        future_df = pd.DataFrame({"ds": y_test.index})
+        future_df["ds"] = pd.to_datetime(future_df["ds"]).dt.tz_localize(None)
+        future_df["ds"] = future_df["ds"].dt.to_period("M").dt.to_timestamp()
+        forecast = model.predict(future_df)
+        y_pred = pd.Series(forecast["yhat"].values, index=y_test.index)
+
+        metrics["Test_MAE"] = safe_mae(y_test.values, y_pred.values)
+        metrics["Test_RMSE"] = safe_rmse(y_test.values, y_pred.values)
+        metrics["Forecast_valid"] = np.isfinite(y_pred.values).all() and len(y_pred) == len(y_test)
+    except Exception as exc:
+        sku_txt = f"{sku}/{bu}" if sku or bu else ""
+        print(f"Prophet failed for SKU {sku_txt}: {exc}")
+        metrics["Skip_Reason"] = f"Prophet failed: {exc}"
+        return metrics
+
+    # ROCV
+    try:
+        rocv_maes = []
+        min_train = max(24, ROCV_MIN_OBS)
+        for origin in range(min_train, len(y_clean) - ROCV_HORIZON + 1):
+            y_train_rocv = y_clean.iloc[:origin]
+            y_test_rocv = y_clean.iloc[origin:origin + ROCV_HORIZON]
+            train_df = _prepare_prophet_df(y_train_rocv)
+            if train_df.empty:
+                continue
+            model = Prophet(
+                yearly_seasonality=True,
+                weekly_seasonality=False,
+                daily_seasonality=False,
+                seasonality_mode="additive",
+                changepoint_prior_scale=0.05,
+            )
+            model.fit(train_df)
+            future_df = pd.DataFrame({"ds": y_test_rocv.index})
+            future_df["ds"] = pd.to_datetime(future_df["ds"]).dt.tz_localize(None)
+            future_df["ds"] = future_df["ds"].dt.to_period("M").dt.to_timestamp()
+            forecast = model.predict(future_df)
+            preds = pd.Series(forecast["yhat"].values, index=y_test_rocv.index)
+            err = safe_mae(y_test_rocv.values, preds.values)
+            if not np.isnan(err):
+                rocv_maes.append(err)
+
+        if rocv_maes:
+            metrics["ROCV_MAE"] = float(np.mean(rocv_maes))
+        else:
+            metrics["ROCV_MAE"] = np.nan
+            if not metrics["Skip_Reason"]:
+                metrics["Skip_Reason"] = "No valid ROCV origins."
+    except Exception:
+        metrics["ROCV_MAE"] = np.nan
+
+    return metrics
+
+
+def _candidate_passes_rules(m, baseline, epsilon=EPSILON_IMPROVEMENT, delta=DELTA_ROCV_TOLERANCE):
+    if baseline is None:
+        return False
+
+    if m.get("Requires_Future_Exog"):
+        return False
+    if m.get("Forecast_valid") is False:
+        return False
+
+    mae = m.get("Test_MAE", np.nan)
+    rocv = m.get("ROCV_MAE", np.nan)
+    baseline_mae = baseline.get("Test_MAE", np.nan)
+    baseline_rocv = baseline.get("ROCV_MAE", np.nan)
+
+    if np.isnan(mae) or np.isnan(baseline_mae):
+        return False
+
+    if mae > baseline_mae * (1.0 - epsilon):
+        return False
+
+    if (not np.isnan(baseline_rocv)) and (not np.isnan(rocv)):
+        if rocv > baseline_rocv * (1.0 + delta):
+            return False
+
+    if np.isnan(rocv) and not np.isnan(baseline_rocv):
+        return False
+
+    return True
 
 
 def choose_best_model(metrics_list, epsilon=EPSILON_IMPROVEMENT, delta=DELTA_ROCV_TOLERANCE):
@@ -678,26 +1095,8 @@ def choose_best_model(metrics_list, epsilon=EPSILON_IMPROVEMENT, delta=DELTA_ROC
         if m["Model"] in baseline_models:
             continue  # baseline is always a fallback, not an "accepted regressor" candidate
 
-        mae = m["Test_MAE"]
-        rocv = m["ROCV_MAE"]
-
-        if np.isnan(mae):
-            continue
-
-        # Rule 1: must improve MAE by at least epsilon
-        if mae > baseline_mae * (1.0 - epsilon):
-            continue
-
-        # Rule 2: ROCV stability (if ROCV_MAE available for both)
-        if (not np.isnan(baseline_rocv)) and (not np.isnan(rocv)):
-            if rocv > baseline_rocv * (1.0 + delta):
-                continue
-
-        # If ROCV is NaN, we don't auto-accept (for now, you can relax this if you want)
-        if np.isnan(rocv) and not np.isnan(baseline_rocv):
-            continue
-
-        accepted.append(m)
+        if _candidate_passes_rules(m, baseline, epsilon=epsilon, delta=delta):
+            accepted.append(m)
 
     if not accepted:
         # No regressor model passes the rules → choose baseline
@@ -706,6 +1105,20 @@ def choose_best_model(metrics_list, epsilon=EPSILON_IMPROVEMENT, delta=DELTA_ROC
     # If multiple accepted, choose the one with lowest Test_MAE
     best = min(accepted, key=mae_rmse_key)
     return best, baseline
+
+
+def _model_type(model_name: str) -> str:
+    if model_name == "ML_GBR":
+        return "ML"
+    if model_name == "PROPHET":
+        return "PROPHET"
+    if model_name == "ETS_baseline":
+        return "ETS"
+    if model_name == "SARIMA_baseline":
+        return "SARIMA"
+    if model_name.startswith("SARIMAX"):
+        return "SARIMAX"
+    return "Other"
 
 
 def engineer_regressors(df_sku):
@@ -836,9 +1249,30 @@ def load_orders_map(path=ORDER_FILE, overrides_path=None):
 
 
 def main():
+    args = _parse_args()
+    enable_ml = ENABLE_ML_CHALLENGER and (not args.disable_ml)
+    enable_prophet = ENABLE_PROPHET_CHALLENGER and (not args.disable_prophet)
+    if enable_ml:
+        print("ML challenger enabled — evaluating ML_GBR candidate.")
+    else:
+        print("ML challenger disabled (ENABLE_ML_CHALLENGER=False) — skipping ML candidate evaluation.")
+    if enable_prophet:
+        if PROPHET_AVAILABLE:
+            print("Prophet challenger enabled — evaluating PROPHET candidate.")
+        else:
+            print("Prophet not installed; skipping Prophet challenger.")
+            enable_prophet = False
+    else:
+        print("Prophet challenger disabled (ENABLE_PROPHET_CHALLENGER=False) — skipping Prophet candidate evaluation.")
+
     print("Loading data...")
     df_all = pd.read_excel(INPUT_FILE)
     df_all = aggregate_monthly_duplicates(df_all)
+    df_all = mark_prelaunch_actuals_as_missing(
+        df_all,
+        output_excel_path=REVISED_ACTUALS_FILE,
+        output_sheet=REVISED_ACTUALS_SHEET,
+    )
     print(f"Loading per-SKU SARIMA orders from {ORDER_FILE}...")
     orders_map = load_orders_map(ORDER_FILE, overrides_path=NOTES_FILE)
 
@@ -891,7 +1325,21 @@ def main():
 
         y = df_sku[COL_ACTUALS].astype(float)
         n = len(y)
+        y_nonnull = y.dropna()
+        last_actual_dt = y_nonnull.index.max() if not y_nonnull.empty else None
+        nonzero_mask = y_nonnull != 0
+        first_nonzero_dt = y_nonnull[nonzero_mask].index.min() if nonzero_mask.any() else None
+        if first_nonzero_dt is not None and last_actual_dt is not None:
+            months_since_first_nonzero = (
+                last_actual_dt.to_period("M") - first_nonzero_dt.to_period("M")
+            ).n
+        else:
+            months_since_first_nonzero = -1
+        history_months = len(y_nonnull)
+        allow_sarima = history_months >= 12 and months_since_first_nonzero >= 11
+        allow_sarimax = history_months >= 36 and allow_sarima
         baseline_rocv_spec = build_rocv_spec(y, exog_series=None)
+        test_horizon = _compute_test_window(history_months)
 
         if n < MIN_OBS_TOTAL:
             print(f"  -> Skipping (only {n} observations; need at least {MIN_OBS_TOTAL}).")
@@ -921,45 +1369,48 @@ def main():
         ranking_rows = []
 
         # --- Baseline model ---
-        print("  Fitting SARIMA_baseline...")
-        baseline_metrics = evaluate_single_model(
-            y=y,
-            exog=None,
-            model_name="SARIMA_baseline",
-            horizon=TEST_HORIZON,
-            order=order,
-            seasonal_order=seasonal_order,
-            sku=prod,
-            bu=div,
-            rocv_spec=baseline_rocv_spec
-        )
-        if (
-            baseline_metrics is not None
-            and not np.isnan(baseline_metrics.get("Test_MAE", np.nan))
-            and abs(baseline_metrics["Test_MAE"]) <= BASELINE_MAE_ZERO_EPS
-        ):
-            print(f"[INFO] Baseline MAE ~0 for {prod}/{div}; treating as perfect baseline.")
-        metrics_list.append(baseline_metrics)
-        ranking_rows.append({
-            "Product": prod,
-            "Division": div,
-            "Model": baseline_metrics["Model"],
-            "Test_MAE": baseline_metrics["Test_MAE"],
-            "Test_RMSE": baseline_metrics["Test_RMSE"],
-            "ROCV_MAE": baseline_metrics["ROCV_MAE"],
-            "AIC": baseline_metrics["AIC"],
-            "BIC": baseline_metrics["BIC"],
-            "Regressor_Name": None,
-            "Regressor_Lag": None,
-            "Accepted_by_rules": False  # baseline not part of acceptance set
-        })
+        if allow_sarima:
+            print("  Fitting SARIMA_baseline...")
+            baseline_metrics = evaluate_single_model(
+                y=y,
+                exog=None,
+                model_name="SARIMA_baseline",
+                horizon=test_horizon,
+                order=order,
+                seasonal_order=seasonal_order,
+                sku=prod,
+                bu=div,
+                rocv_spec=baseline_rocv_spec
+            )
+            if (
+                baseline_metrics is not None
+                and not np.isnan(baseline_metrics.get("Test_MAE", np.nan))
+                and abs(baseline_metrics["Test_MAE"]) <= BASELINE_MAE_ZERO_EPS
+            ):
+                print(f"[INFO] Baseline MAE ~0 for {prod}/{div}; treating as perfect baseline.")
+            metrics_list.append(baseline_metrics)
+            ranking_rows.append({
+                "Product": prod,
+                "Division": div,
+                "Model": baseline_metrics["Model"],
+                "Test_MAE": baseline_metrics["Test_MAE"],
+                "Test_RMSE": baseline_metrics["Test_RMSE"],
+                "ROCV_MAE": baseline_metrics["ROCV_MAE"],
+                "AIC": baseline_metrics["AIC"],
+                "BIC": baseline_metrics["BIC"],
+                "Regressor_Name": None,
+                "Regressor_Lag": None,
+                "Accepted_by_rules": False  # baseline not part of acceptance set
+            })
+        else:
+            print("  Skipping SARIMA_baseline: history <12 months or first non-zero <12 months ago.")
 
         # --- ETS baseline ---
         print("  Fitting ETS_baseline...")
         ets_metrics = evaluate_ets_model(
             y=y,
             model_name="ETS_baseline",
-            horizon=TEST_HORIZON,
+            horizon=test_horizon,
             sku=prod,
             bu=div,
             rocv_spec=baseline_rocv_spec
@@ -980,132 +1431,200 @@ def main():
         })
 
         # --- SARIMAX with New_Opportunities lags 1-3 ---
-        for lag in [1, 2, 3]:
-            col = f"New_Opportunities_l{lag}"
-            if col in df_sku.columns:
-                print(f"  Fitting SARIMAX_{col}...")
-                exog_series = df_sku[col].astype(float)
-                exog_clean_full = exog_series.ffill().bfill()
-                non_nan = exog_clean_full.dropna()
-                exog_invalid = (len(non_nan) == 0) or (non_nan.nunique() <= 1)
-                rocv_spec = None if exog_invalid else build_rocv_spec(y, exog_series=exog_clean_full)
-                metrics_list.append(
-                    evaluate_single_model(
-                        y=y,
-                        exog=exog_series,
-                        model_name=f"SARIMAX_{col}",
-                        horizon=TEST_HORIZON,
+        if allow_sarimax:
+            for lag in [1, 2, 3]:
+                col = f"New_Opportunities_l{lag}"
+                if col in df_sku.columns:
+                    print(f"  Fitting SARIMAX_{col}...")
+                    exog_series = df_sku[col].astype(float)
+                    exog_clean_full = exog_series.ffill().bfill()
+                    non_nan = exog_clean_full.dropna()
+                    exog_invalid = (len(non_nan) == 0) or (non_nan.nunique() <= 1)
+                    rocv_spec = None if exog_invalid else build_rocv_spec(y, exog_series=exog_clean_full)
+                    metrics_list.append(
+                        evaluate_single_model(
+                            y=y,
+                            exog=exog_series,
+                            model_name=f"SARIMAX_{col}",
+                        horizon=test_horizon,
                         order=order,
                         seasonal_order=seasonal_order,
                         sku=prod,
-                        bu=div,
-                        exog_clean_full=exog_clean_full,
-                        rocv_spec=rocv_spec,
-                        exog_invalid=exog_invalid
+                            bu=div,
+                            exog_clean_full=exog_clean_full,
+                            rocv_spec=rocv_spec,
+                            exog_invalid=exog_invalid
+                        )
                     )
-                )
-                metrics_row = metrics_list[-1]
-                ranking_rows.append({
-                    "Product": prod,
-                    "Division": div,
-                    "Model": metrics_row["Model"],
-                    "Test_MAE": metrics_row["Test_MAE"],
-                    "Test_RMSE": metrics_row["Test_RMSE"],
-                    "ROCV_MAE": metrics_row["ROCV_MAE"],
-                    "AIC": metrics_row["AIC"],
-                    "BIC": metrics_row["BIC"],
-                    "Regressor_Name": "New_Opportunities",
-                    "Regressor_Lag": lag,
-                    "Accepted_by_rules": False  # updated later once chosen
-                })
+                    metrics_row = metrics_list[-1]
+                    ranking_rows.append({
+                        "Product": prod,
+                        "Division": div,
+                        "Model": metrics_row["Model"],
+                        "Test_MAE": metrics_row["Test_MAE"],
+                        "Test_RMSE": metrics_row["Test_RMSE"],
+                        "ROCV_MAE": metrics_row["ROCV_MAE"],
+                        "AIC": metrics_row["AIC"],
+                        "BIC": metrics_row["BIC"],
+                        "Regressor_Name": "New_Opportunities",
+                        "Regressor_Lag": lag,
+                        "Accepted_by_rules": False  # updated later once chosen
+                    })
+        else:
+            print("  Skipping SARIMAX (New_Opportunities): history <36 months or SARIMA gate not met.")
 
         # --- SARIMAX with Open_Opportunities lags 1-3 ---
-        for lag in [1, 2, 3]:
-            col = f"Open_Opportunities_l{lag}"
-            if col in df_sku.columns:
-                print(f"  Fitting SARIMAX_{col}...")
-                exog_series = df_sku[col].astype(float)
-                exog_clean_full = exog_series.ffill().bfill()
-                non_nan = exog_clean_full.dropna()
-                exog_invalid = (len(non_nan) == 0) or (non_nan.nunique() <= 1)
-                rocv_spec = None if exog_invalid else build_rocv_spec(y, exog_series=exog_clean_full)
-                metrics_list.append(
-                    evaluate_single_model(
-                        y=y,
-                        exog=exog_series,
-                        model_name=f"SARIMAX_{col}",
-                        horizon=TEST_HORIZON,
+        if allow_sarimax:
+            for lag in [1, 2, 3]:
+                col = f"Open_Opportunities_l{lag}"
+                if col in df_sku.columns:
+                    print(f"  Fitting SARIMAX_{col}...")
+                    exog_series = df_sku[col].astype(float)
+                    exog_clean_full = exog_series.ffill().bfill()
+                    non_nan = exog_clean_full.dropna()
+                    exog_invalid = (len(non_nan) == 0) or (non_nan.nunique() <= 1)
+                    rocv_spec = None if exog_invalid else build_rocv_spec(y, exog_series=exog_clean_full)
+                    metrics_list.append(
+                        evaluate_single_model(
+                            y=y,
+                            exog=exog_series,
+                            model_name=f"SARIMAX_{col}",
+                        horizon=test_horizon,
                         order=order,
                         seasonal_order=seasonal_order,
                         sku=prod,
-                        bu=div,
-                        exog_clean_full=exog_clean_full,
-                        rocv_spec=rocv_spec,
-                        exog_invalid=exog_invalid
+                            bu=div,
+                            exog_clean_full=exog_clean_full,
+                            rocv_spec=rocv_spec,
+                            exog_invalid=exog_invalid
+                        )
                     )
-                )
-                metrics_row = metrics_list[-1]
-                ranking_rows.append({
-                    "Product": prod,
-                    "Division": div,
-                    "Model": metrics_row["Model"],
-                    "Test_MAE": metrics_row["Test_MAE"],
-                    "Test_RMSE": metrics_row["Test_RMSE"],
-                    "ROCV_MAE": metrics_row["ROCV_MAE"],
-                    "AIC": metrics_row["AIC"],
-                    "BIC": metrics_row["BIC"],
-                    "Regressor_Name": "Open_Opportunities",
-                    "Regressor_Lag": lag,
-                    "Accepted_by_rules": False
-                })
+                    metrics_row = metrics_list[-1]
+                    ranking_rows.append({
+                        "Product": prod,
+                        "Division": div,
+                        "Model": metrics_row["Model"],
+                        "Test_MAE": metrics_row["Test_MAE"],
+                        "Test_RMSE": metrics_row["Test_RMSE"],
+                        "ROCV_MAE": metrics_row["ROCV_MAE"],
+                        "AIC": metrics_row["AIC"],
+                        "BIC": metrics_row["BIC"],
+                        "Regressor_Name": "Open_Opportunities",
+                        "Regressor_Lag": lag,
+                        "Accepted_by_rules": False
+                    })
+        else:
+            print("  Skipping SARIMAX (Open_Opportunities): history <36 months or SARIMA gate not met.")
 
         # --- SARIMAX with Bookings lags 1-2 ---
-        for lag in [1, 2]:
-            col = f"Bookings_l{lag}"
-            if col in df_sku.columns:
-                print(f"  Fitting SARIMAX_{col}...")
-                exog_series = df_sku[col].astype(float)
-                exog_clean_full = exog_series.ffill().bfill()
-                non_nan = exog_clean_full.dropna()
-                exog_invalid = (len(non_nan) == 0) or (non_nan.nunique() <= 1)
-                rocv_spec = None if exog_invalid else build_rocv_spec(y, exog_series=exog_clean_full)
-                metrics_list.append(
-                    evaluate_single_model(
-                        y=y,
-                        exog=exog_series,
-                        model_name=f"SARIMAX_{col}",
-                        horizon=TEST_HORIZON,
+        if allow_sarimax:
+            for lag in [1, 2]:
+                col = f"Bookings_l{lag}"
+                if col in df_sku.columns:
+                    print(f"  Fitting SARIMAX_{col}...")
+                    exog_series = df_sku[col].astype(float)
+                    exog_clean_full = exog_series.ffill().bfill()
+                    non_nan = exog_clean_full.dropna()
+                    exog_invalid = (len(non_nan) == 0) or (non_nan.nunique() <= 1)
+                    rocv_spec = None if exog_invalid else build_rocv_spec(y, exog_series=exog_clean_full)
+                    metrics_list.append(
+                        evaluate_single_model(
+                            y=y,
+                            exog=exog_series,
+                            model_name=f"SARIMAX_{col}",
+                        horizon=test_horizon,
                         order=order,
                         seasonal_order=seasonal_order,
                         sku=prod,
-                        bu=div,
-                        exog_clean_full=exog_clean_full,
-                        rocv_spec=rocv_spec,
-                        exog_invalid=exog_invalid
+                            bu=div,
+                            exog_clean_full=exog_clean_full,
+                            rocv_spec=rocv_spec,
+                            exog_invalid=exog_invalid
+                        )
                     )
-                )
-                metrics_row = metrics_list[-1]
-                ranking_rows.append({
-                    "Product": prod,
-                    "Division": div,
-                    "Model": metrics_row["Model"],
-                    "Test_MAE": metrics_row["Test_MAE"],
-                    "Test_RMSE": metrics_row["Test_RMSE"],
-                    "ROCV_MAE": metrics_row["ROCV_MAE"],
-                    "AIC": metrics_row["AIC"],
-                    "BIC": metrics_row["BIC"],
-                    "Regressor_Name": "Bookings",
-                    "Regressor_Lag": lag,
-                    "Accepted_by_rules": False
-                })
+                    metrics_row = metrics_list[-1]
+                    ranking_rows.append({
+                        "Product": prod,
+                        "Division": div,
+                        "Model": metrics_row["Model"],
+                        "Test_MAE": metrics_row["Test_MAE"],
+                        "Test_RMSE": metrics_row["Test_RMSE"],
+                        "ROCV_MAE": metrics_row["ROCV_MAE"],
+                        "AIC": metrics_row["AIC"],
+                        "BIC": metrics_row["BIC"],
+                        "Regressor_Name": "Bookings",
+                        "Regressor_Lag": lag,
+                        "Accepted_by_rules": False
+                    })
+        else:
+            print("  Skipping SARIMAX (Bookings): history <36 months or SARIMA gate not met.")
+
+        # --- ML challenger (GradientBoostingRegressor) ---
+        if enable_ml:
+            print("  Evaluating ML_GBR...")
+            ml_metrics = evaluate_ml_candidate(df_sku, horizon=test_horizon)
+            metrics_list.append(ml_metrics)
+            if ml_metrics.get("Skip_Reason"):
+                print(f"  -> ML skipped: {ml_metrics['Skip_Reason']}")
+            ranking_rows.append({
+                "Product": prod,
+                "Division": div,
+                "Model": ml_metrics["Model"],
+                "Model_Type": _model_type(ml_metrics["Model"]),
+                "Test_MAE": ml_metrics["Test_MAE"],
+                "Test_RMSE": ml_metrics["Test_RMSE"],
+                "ROCV_MAE": ml_metrics["ROCV_MAE"],
+                "AIC": ml_metrics["AIC"],
+                "BIC": ml_metrics["BIC"],
+                "Regressor_Name": None,
+                "Regressor_Lag": None,
+                "Accepted_by_rules": False,
+                "Skip_Reason": ml_metrics.get("Skip_Reason", ""),
+            })
+
+        # --- Prophet challenger ---
+        if enable_prophet:
+            print("  Evaluating PROPHET...")
+            prophet_metrics = _evaluate_prophet_metrics(y, horizon=test_horizon, sku=prod, bu=div)
+            metrics_list.append(prophet_metrics)
+            if prophet_metrics.get("Skip_Reason"):
+                print(f"  -> Prophet skipped: {prophet_metrics['Skip_Reason']}")
+            ranking_rows.append({
+                "Product": prod,
+                "Division": div,
+                "Model": prophet_metrics["Model"],
+                "Model_Type": _model_type(prophet_metrics["Model"]),
+                "Test_MAE": prophet_metrics["Test_MAE"],
+                "Test_RMSE": prophet_metrics["Test_RMSE"],
+                "ROCV_MAE": prophet_metrics["ROCV_MAE"],
+                "AIC": prophet_metrics["AIC"],
+                "BIC": prophet_metrics["BIC"],
+                "Regressor_Name": None,
+                "Regressor_Lag": None,
+                "Accepted_by_rules": False,
+                "Skip_Reason": prophet_metrics.get("Skip_Reason", ""),
+            })
 
         # --- Choose best model according to rules ---
         best_model, baseline = choose_best_model(metrics_list)
+        if (enable_ml or enable_prophet) and baseline is not None:
+            baseline_models = {"SARIMA_baseline", "ETS_baseline"}
+            accepted_models = {
+                m["Model"] for m in metrics_list
+                if m["Model"] not in baseline_models and _candidate_passes_rules(m, baseline)
+            }
+            for row in ranking_rows:
+                row["Accepted_by_rules"] = row["Model"] in accepted_models
 
-        # Identify best non-baseline candidate by Test_MAE (forcing regressor if available)
+        # Identify best non-baseline candidate by Test_MAE.
+        # Prefer a SARIMAX candidate when available so regressor fields populate.
         non_baseline_candidates = [
             m for m in metrics_list
             if m["Model"] not in {"SARIMA_baseline", "ETS_baseline"} and not np.isnan(m["Test_MAE"])
+        ]
+        sarimax_candidates = [
+            m for m in non_baseline_candidates
+            if isinstance(m.get("Model"), str) and m["Model"].startswith("SARIMAX")
         ]
         def mae_rmse_key_local(m):
             mae = m.get("Test_MAE", np.nan)
@@ -1115,10 +1634,11 @@ def main():
                 rmse if np.isfinite(rmse) else np.inf,
             )
 
-        best_nonbaseline = (
-            min(non_baseline_candidates, key=mae_rmse_key_local)
-            if non_baseline_candidates else None
-        )
+        best_nonbaseline = None
+        if sarimax_candidates:
+            best_nonbaseline = min(sarimax_candidates, key=mae_rmse_key_local)
+        elif non_baseline_candidates:
+            best_nonbaseline = min(non_baseline_candidates, key=mae_rmse_key_local)
 
         if best_model is None:
             print("  -> No valid model metrics; marking as FAILED.")
@@ -1206,10 +1726,12 @@ def main():
         print(f"  -> Chosen model: {best_model['Model']}")
         print(f"     Baseline MAE: {baseline_mae:.3f} | Chosen MAE: {chosen_mae:.3f} | Improvement: {mae_improvement_pct * 100 if not np.isnan(mae_improvement_pct) else np.nan:.2f}%")
 
+        model_type = _model_type(best_model["Model"]) if (enable_ml or enable_prophet) else None
         results_rows.append({
             "Product": prod,
             "Division": div,
             "Chosen_Model": best_model["Model"],
+            **({"Model_Type": model_type} if (enable_ml or enable_prophet) else {}),
             "Best_NonBaseline_Model": best_nonbaseline_model,
             "Best_NonBaseline_Regressor_Name": best_nonbaseline_reg_name,
             "Best_NonBaseline_Regressor_Lag": best_nonbaseline_reg_lag,
@@ -1241,7 +1763,12 @@ def main():
     # Nice ordering of columns
     col_order = [
         "Product", "Division",
-        "Chosen_Model", "Best_NonBaseline_Model", "Accepted_by_rules",
+        "Chosen_Model",
+    ]
+    if enable_ml or enable_prophet:
+        col_order.append("Model_Type")
+    col_order.extend([
+        "Best_NonBaseline_Model", "Accepted_by_rules",
         "Baseline_MAE", "Baseline_ROCV_MAE",
         "Chosen_MAE", "Chosen_RMSE", "Chosen_ROCV_MAE",
         "MAE_Improvement_Pct",
@@ -1250,7 +1777,7 @@ def main():
         "Regressor_Coef", "Regressor_pvalue",
         "Baseline_AIC", "Baseline_BIC",
         "Chosen_AIC", "Chosen_BIC"
-    ]
+    ])
     # Ensure any missing columns exist (e.g., when rows were skipped or failed early)
     for col in col_order:
         if col not in df_results.columns:
@@ -1260,6 +1787,11 @@ def main():
     # Build ranking table (one row per model candidate) if available
     df_rankings = pd.DataFrame(ranking_rows_all)
     if not df_rankings.empty:
+        if enable_ml or enable_prophet:
+            if "Model_Type" not in df_rankings.columns:
+                df_rankings["Model_Type"] = df_rankings["Model"].apply(_model_type)
+            if "Skip_Reason" not in df_rankings.columns:
+                df_rankings["Skip_Reason"] = ""
         # rank within SKU by Test_MAE (ascending)
         df_rankings["Rank_by_Test_MAE"] = (
             df_rankings.groupby(["Product", "Division"])["Test_MAE"]
@@ -1287,4 +1819,5 @@ if __name__ == "__main__":
     t0 = time.perf_counter()
     main()
     elapsed = time.perf_counter() - t0
-    print(f"\nTotal runtime: {elapsed:,.2f} seconds")
+    minutes = elapsed / 60.0
+    print(f"\nTotal runtime: {elapsed:,.2f} seconds ({minutes:,.2f} minutes)")
