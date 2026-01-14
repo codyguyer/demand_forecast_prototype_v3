@@ -25,6 +25,7 @@ except Exception:
 # 1. CONFIG
 # ===========================
 
+OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 INPUT_FILE = "all_products_with_sf_and_bookings.xlsx"  # <--- change to your file
 REVISED_ACTUALS_FILE = "all_products_with_sf_and_bookings_revised.xlsx"
 REVISED_ACTUALS_SHEET = "Revised Actuals"
@@ -53,14 +54,16 @@ MIN_OBS_TOTAL = 30      # minimum total points to attempt modeling
 ROCV_MIN_OBS = 24       # minimum obs for rolling-origin CV
 ROCV_HORIZON = 1        # 1-step ahead in ROCV
 
-# Recommended model selection thresholds
-MAE_TOLERANCE = 0.20
-RMSE_TOLERANCE = 0.20
-ROCV_HARD_MULTIPLIER = 1.50
-ROCV_PREFERRED_LOWER = 0.85
-ROCV_PREFERRED_UPPER = 1.15
-ROCV_TOO_SMOOTH = 0.70
-ROCV_TOO_NOISY = 1.5
+# Weighted MAE buckets for the holdout horizon (month index from holdout start).
+WEIGHTED_MAE_BUCKETS = [
+    (1, 3, 0.50),   # months 1-3 (closest to forecast origin)
+    (4, 6, 0.30),   # months 4-6
+    (7, 12, 0.20),  # months 7-12
+]
+
+# Acceptance thresholds
+EPSILON_IMPROVEMENT = 0.02  # model must improve Test MAE by at least 2%
+DELTA_ROCV_TOLERANCE = 0.05 # ROCV_MAE can be up to 5% worse than baseline
 BASELINE_MAE_ZERO_EPS = 1e-9  # treat MAE at or below this as effectively zero
 ETS_SEASONAL_PERIODS = 12     # monthly data
 
@@ -68,6 +71,14 @@ ETS_SEASONAL_PERIODS = 12     # monthly data
 # ===========================
 # 2. HELPER FUNCTIONS
 # ===========================
+
+def _output_path(filename: str) -> str:
+    if not filename:
+        return filename
+    if os.path.isabs(filename) or os.path.dirname(filename):
+        return filename
+    return os.path.join(OUTPUT_DIR, filename)
+
 
 def _parse_args():
     parser = argparse.ArgumentParser(description="Multi-SKU SARIMA/SARIMAX/ETS/ML evaluation engine")
@@ -146,6 +157,7 @@ def mark_prelaunch_actuals_as_missing(
         df = _apply(df)
 
     if output_excel_path:
+        output_excel_path = _output_path(output_excel_path)
         with pd.ExcelWriter(output_excel_path, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name=output_sheet, index=False)
         print(f"Wrote revised actuals to {output_excel_path} ({output_sheet}).")
@@ -161,6 +173,47 @@ def safe_mae(y_true, y_pred):
     if mask.sum() == 0:
         return np.nan
     return mean_absolute_error(y_true[mask], y_pred[mask])
+
+
+def _build_holdout_weights(horizon: int, buckets=WEIGHTED_MAE_BUCKETS) -> np.ndarray:
+    """Build normalized per-step weights for a holdout horizon (1-based month index)."""
+    if horizon <= 0:
+        return np.array([], dtype="float64")
+    weights = np.zeros(horizon, dtype="float64")
+    for start, end, total_weight in buckets:
+        if horizon < start:
+            continue
+        bucket_end = min(end, horizon)
+        bucket_len = bucket_end - start + 1
+        if bucket_len <= 0:
+            continue
+        weights[start - 1:bucket_end] = total_weight / bucket_len
+    total = weights.sum()
+    if total > 0:
+        weights = weights / total
+    return weights
+
+
+def safe_weighted_mae(y_true, y_pred, buckets=WEIGHTED_MAE_BUCKETS):
+    """Compute weighted MAE, renormalizing weights over valid (finite) points."""
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    n = min(len(y_true), len(y_pred))
+    if n == 0:
+        return np.nan
+    y_true = y_true[:n]
+    y_pred = y_pred[:n]
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    if mask.sum() == 0:
+        return np.nan
+    weights = _build_holdout_weights(n, buckets=buckets)
+    weights = weights[mask]
+    total = weights.sum()
+    if total <= 0:
+        return np.nan
+    weights = weights / total
+    errors = np.abs(y_true[mask] - y_pred[mask])
+    return float(np.average(errors, weights=weights))
 
 
 def safe_rmse(y_true, y_pred):
@@ -186,6 +239,7 @@ def _regressor_failure_metrics(model_name):
     return {
         "Model": model_name,
         "Test_MAE": 1e9,
+        "Test_WMAE": 1e9,
         "Test_RMSE": 1e9,
         "AIC": np.nan,
         "BIC": np.nan,
@@ -561,6 +615,7 @@ def evaluate_ml_candidate(
     metrics = {
         "Model": "ML_GBR",
         "Test_MAE": np.nan,
+        "Test_WMAE": np.nan,
         "Test_RMSE": np.nan,
         "AIC": np.nan,
         "BIC": np.nan,
@@ -599,6 +654,7 @@ def evaluate_ml_candidate(
         return metrics
 
     metrics["Test_MAE"] = safe_mae(test["y"].values, preds)
+    metrics["Test_WMAE"] = safe_weighted_mae(test["y"].values, preds)
     metrics["Test_RMSE"] = safe_rmse(test["y"].values, preds)
 
     rocv_mae, rocv_reason = rolling_origin_cv_ml(df_sku)
@@ -737,6 +793,7 @@ def evaluate_single_model(
         return {
             "Model": model_name,
             "Test_MAE": np.nan,
+            "Test_WMAE": np.nan,
             "Test_RMSE": np.nan,
             "AIC": np.nan,
             "BIC": np.nan,
@@ -796,6 +853,7 @@ def evaluate_single_model(
         return {
             "Model": model_name,
             "Test_MAE": safe_mae(y_test.values, y_pred.values) if not y_pred.isna().all() else 1e9,
+            "Test_WMAE": safe_weighted_mae(y_test.values, y_pred.values) if not y_pred.isna().all() else 1e9,
             "Test_RMSE": safe_rmse(y_test.values, y_pred.values) if not y_pred.isna().all() else 1e9,
             "AIC": float(res.aic),
             "BIC": float(res.bic),
@@ -816,6 +874,7 @@ def evaluate_single_model(
             return {
                 "Model": model_name,
                 "Test_MAE": np.nan,
+                "Test_WMAE": np.nan,
                 "Test_RMSE": np.nan,
                 "AIC": np.nan,
                 "BIC": np.nan,
@@ -835,6 +894,7 @@ def evaluate_single_model(
         return {
             "Model": model_name,
             "Test_MAE": safe_mae(y_test.values, y_pred.values),
+            "Test_WMAE": safe_weighted_mae(y_test.values, y_pred.values),
             "Test_RMSE": safe_rmse(y_test.values, y_pred.values),
             "AIC": float(res.aic),
             "BIC": float(res.bic),
@@ -864,6 +924,7 @@ def evaluate_ets_model(
         return {
             "Model": model_name,
             "Test_MAE": np.nan,
+            "Test_WMAE": np.nan,
             "Test_RMSE": np.nan,
             "AIC": np.nan,
             "BIC": np.nan,
@@ -882,6 +943,7 @@ def evaluate_ets_model(
         return {
             "Model": model_name,
             "Test_MAE": np.nan,
+            "Test_WMAE": np.nan,
             "Test_RMSE": np.nan,
             "AIC": np.nan,
             "BIC": np.nan,
@@ -903,6 +965,7 @@ def evaluate_ets_model(
     return {
         "Model": model_name,
         "Test_MAE": safe_mae(y_test.values, y_pred.values),
+        "Test_WMAE": safe_weighted_mae(y_test.values, y_pred.values),
         "Test_RMSE": safe_rmse(y_test.values, y_pred.values),
         "AIC": float(aic) if np.isfinite(aic) else np.nan,
         "BIC": float(bic) if np.isfinite(bic) else np.nan,
@@ -939,6 +1002,7 @@ def _evaluate_prophet_metrics(y_series, horizon=TEST_HORIZON, sku=None, bu=None)
     metrics = {
         "Model": "PROPHET",
         "Test_MAE": np.nan,
+        "Test_WMAE": np.nan,
         "Test_RMSE": np.nan,
         "AIC": np.nan,
         "BIC": np.nan,
@@ -988,6 +1052,7 @@ def _evaluate_prophet_metrics(y_series, horizon=TEST_HORIZON, sku=None, bu=None)
         y_pred = pd.Series(forecast["yhat"].values, index=y_test.index)
 
         metrics["Test_MAE"] = safe_mae(y_test.values, y_pred.values)
+        metrics["Test_WMAE"] = safe_weighted_mae(y_test.values, y_pred.values)
         metrics["Test_RMSE"] = safe_rmse(y_test.values, y_pred.values)
         metrics["Forecast_valid"] = np.isfinite(y_pred.values).all() and len(y_pred) == len(y_test)
     except Exception as exc:
@@ -1035,143 +1100,97 @@ def _evaluate_prophet_metrics(y_series, horizon=TEST_HORIZON, sku=None, bu=None)
     return metrics
 
 
-def _model_tiebreak_key(m):
+def _candidate_passes_rules(m, baseline, epsilon=EPSILON_IMPROVEMENT, delta=DELTA_ROCV_TOLERANCE):
+    if baseline is None:
+        return False
+
+    if m.get("Requires_Future_Exog"):
+        return False
+    if m.get("Forecast_valid") is False:
+        return False
+
     mae = m.get("Test_MAE", np.nan)
-    rmse = m.get("Test_RMSE", np.nan)
-    model_name = str(m.get("Model", ""))
-    return (
-        mae if np.isfinite(mae) else np.inf,
-        rmse if np.isfinite(rmse) else np.inf,
-        model_name,
-    )
-
-
-def choose_recommended_model(
-    metrics_list,
-    mae_tolerance: float = MAE_TOLERANCE,
-    rmse_tolerance: float = RMSE_TOLERANCE,
-    rocv_hard_multiplier: float = ROCV_HARD_MULTIPLIER,
-    rocv_preferred_lower: float = ROCV_PREFERRED_LOWER,
-    rocv_preferred_upper: float = ROCV_PREFERRED_UPPER,
-    rocv_too_smooth: float = ROCV_TOO_SMOOTH,
-    rocv_too_noisy: float = ROCV_TOO_NOISY,
-):
-    """
-    We anchor model selection on the most accurate forecast, and only deviate from it
-    when another model is similarly accurate and exhibits believable demand variability.
-    """
-    if not metrics_list:
-        return None, None, "No model metrics available.", {}
-
-    valid = [m for m in metrics_list if np.isfinite(m.get("Test_MAE", np.nan))]
-    if not valid:
-        return None, None, "No model metrics available.", {}
-
-    baseline = min(valid, key=_model_tiebreak_key)
+    rocv = m.get("ROCV_MAE", np.nan)
     baseline_mae = baseline.get("Test_MAE", np.nan)
-    baseline_rmse = baseline.get("Test_RMSE", np.nan)
     baseline_rocv = baseline.get("ROCV_MAE", np.nan)
 
-    mae_cutoff = baseline_mae * (1.0 + mae_tolerance)
-    rmse_cutoff = baseline_rmse * (1.0 + rmse_tolerance)
+    if np.isnan(mae) or np.isnan(baseline_mae):
+        return False
 
-    decision = {
-        "baseline_model": baseline.get("Model"),
-        "baseline_mae": baseline_mae,
-        "baseline_rmse": baseline_rmse,
-        "baseline_rocv": baseline_rocv,
-        "mae_cutoff": mae_cutoff,
-        "rmse_cutoff": rmse_cutoff,
-        "rocv_hard_max": np.nan,
-        "rocv_preferred_min": np.nan,
-        "rocv_preferred_max": np.nan,
-        "flags_by_model": {},
-    }
+    if mae > baseline_mae * (1.0 - epsilon):
+        return False
 
-    if np.isnan(baseline_rocv) or baseline_rocv <= 0:
-        decision["reason"] = "Baseline ROCV unavailable or zero; selected lowest-MAE baseline."
-        for m in valid:
-            model_name = m.get("Model")
-            decision["flags_by_model"][model_name] = {
-                "passes_accuracy": model_name == baseline.get("Model"),
-                "passes_rocv_hard": model_name == baseline.get("Model"),
-                "in_preferred_band": False,
-            }
-        return baseline, baseline, decision["reason"], decision
+    if (not np.isnan(baseline_rocv)) and (not np.isnan(rocv)):
+        if rocv > baseline_rocv * (1.0 + delta):
+            return False
 
-    rocv_hard_max = baseline_rocv * rocv_hard_multiplier
-    rocv_preferred_min = baseline_rocv * rocv_preferred_lower
-    rocv_preferred_max = baseline_rocv * rocv_preferred_upper
-    decision.update({
-        "rocv_hard_max": rocv_hard_max,
-        "rocv_preferred_min": rocv_preferred_min,
-        "rocv_preferred_max": rocv_preferred_max,
-    })
+    if np.isnan(rocv) and not np.isnan(baseline_rocv):
+        return False
 
-    candidates = []
-    preferred_candidates = []
-    for m in valid:
-        model_name = m.get("Model")
-        mae = m.get("Test_MAE", np.nan)
+    return True
+
+
+def choose_best_model(metrics_list, epsilon=EPSILON_IMPROVEMENT, delta=DELTA_ROCV_TOLERANCE):
+    """
+    Given a list of metrics dicts (all for same SKU),
+    apply acceptance rules and pick a best model.
+    Returns chosen dict + baseline dict + some derived fields.
+    """
+    if not metrics_list:
+        return None, None
+
+    def _weighted_mae(m):
+        wmae = m.get("Test_WMAE", np.nan)
+        if np.isfinite(wmae):
+            return wmae
+        return m.get("Test_MAE", np.nan)
+
+    def wmae_rmse_key(m):
+        mae = _weighted_mae(m)
         rmse = m.get("Test_RMSE", np.nan)
-        rocv = m.get("ROCV_MAE", np.nan)
-
-        passes_accuracy = bool(np.isfinite(mae) and np.isfinite(rmse) and mae <= mae_cutoff and rmse <= rmse_cutoff)
-        passes_rocv_hard = bool(np.isfinite(rocv) and rocv <= rocv_hard_max)
-        if model_name == baseline.get("Model"):
-            passes_accuracy = True
-            passes_rocv_hard = True
-
-        in_preferred_band = bool(np.isfinite(rocv) and rocv_preferred_min <= rocv <= rocv_preferred_max)
-
-        decision["flags_by_model"][model_name] = {
-            "passes_accuracy": passes_accuracy,
-            "passes_rocv_hard": passes_rocv_hard,
-            "in_preferred_band": in_preferred_band,
-        }
-
-        if passes_accuracy and passes_rocv_hard:
-            candidates.append(m)
-            if in_preferred_band:
-                preferred_candidates.append(m)
-
-    if not candidates:
-        decision["reason"] = (
-            "No alternative model met accuracy and variability sanity thresholds; "
-            "selected lowest-MAE baseline."
+        return (
+            mae if np.isfinite(mae) else np.inf,
+            rmse if np.isfinite(rmse) else np.inf,
         )
-        return baseline, baseline, decision["reason"], decision
 
-    if preferred_candidates:
-        selected = min(preferred_candidates, key=_model_tiebreak_key)
-        decision["reason"] = "Selected among accurate models with variability aligned to the baseline forecast."
-    else:
-        selected = min(candidates, key=_model_tiebreak_key)
-        decision["reason"] = "Selected most accurate model among those passing variability sanity checks."
+    baseline_models = {"SARIMA_baseline", "ETS_baseline"}
+    baseline_candidates = [m for m in metrics_list if m["Model"] in baseline_models]
+    baseline = min(baseline_candidates, key=wmae_rmse_key) if baseline_candidates else None
 
-    if selected.get("Model") != baseline.get("Model"):
-        selected_rocv = selected.get("ROCV_MAE", np.nan)
-        too_smooth = np.isfinite(selected_rocv) and selected_rocv < baseline_rocv * rocv_too_smooth
-        too_noisy = np.isfinite(selected_rocv) and selected_rocv > baseline_rocv * rocv_too_noisy
-        if too_smooth or too_noisy:
-            if too_smooth and too_noisy:
-                decision["reason"] = (
-                    "Selected model ROCV was outside acceptable smoothness/noise bounds; "
-                    "reverted to lowest-MAE baseline."
-                )
-            elif too_smooth:
-                decision["reason"] = (
-                    "Selected model ROCV was too smooth relative to baseline; "
-                    "reverted to lowest-MAE baseline."
-                )
-            else:
-                decision["reason"] = (
-                    "Selected model ROCV was too noisy relative to baseline; "
-                    "reverted to lowest-MAE baseline."
-                )
-            return baseline, baseline, decision["reason"], decision
+    if baseline is None:
+        # Fallback: choose minimum weighted MAE
+        valid = [m for m in metrics_list if np.isfinite(_weighted_mae(m))]
+        if not valid:
+            return None, None
+        best = min(valid, key=wmae_rmse_key)
+        return best, None
 
-    return selected, baseline, decision["reason"], decision
+    baseline_mae = baseline["Test_MAE"]
+    baseline_rocv = baseline["ROCV_MAE"]
+
+    # If baseline itself is NaN on Test_MAE, just choose lowest weighted MAE overall
+    if np.isnan(baseline_mae):
+        valid = [m for m in metrics_list if np.isfinite(_weighted_mae(m))]
+        if not valid:
+            return None, baseline
+        best = min(valid, key=wmae_rmse_key)
+        return best, baseline
+
+    accepted = []
+    for m in metrics_list:
+        if m["Model"] in baseline_models:
+            continue  # baseline is always a fallback, not an "accepted regressor" candidate
+
+        if _candidate_passes_rules(m, baseline, epsilon=epsilon, delta=delta):
+            accepted.append(m)
+
+    if not accepted:
+        # No regressor model passes the rules → choose baseline
+        return baseline, baseline
+
+    # If multiple accepted, choose the one with lowest weighted MAE
+    best = min(accepted, key=wmae_rmse_key)
+    return best, baseline
 
 
 def _model_type(model_name: str) -> str:
@@ -1368,7 +1387,7 @@ def main():
     df_all = aggregate_monthly_duplicates(df_all)
     df_all = mark_prelaunch_actuals_as_missing(
         df_all,
-        output_excel_path=REVISED_ACTUALS_FILE,
+        output_excel_path=_output_path(REVISED_ACTUALS_FILE),
         output_sheet=REVISED_ACTUALS_SHEET,
     )
     print(f"Loading per-SKU SARIMA orders from {ORDER_FILE}...")
@@ -1379,7 +1398,6 @@ def main():
     df_all = df_all.sort_values([COL_PRODUCT, COL_DIVISION, COL_DATE])
 
     results_rows = []
-    recommended_rows = []
     ranking_rows_all = []
     skipped_no_order = []
 
@@ -1413,20 +1431,6 @@ def main():
                 "Chosen_AIC": np.nan,
                 "Chosen_BIC": np.nan,
                 "Accepted_by_rules": False
-            })
-            recommended_rows.append({
-                "Product": prod,
-                "Division": div,
-                "Recommended_Model": "NO_ORDER_IN_FILE",
-                "Reason": "No order in order search summary.",
-                "baseline_model": None,
-                "baseline_mae": np.nan,
-                "baseline_rocv": np.nan,
-                "mae_cutoff": np.nan,
-                "rmse_cutoff": np.nan,
-                "rocv_hard_max": np.nan,
-                "rocv_preferred_min": np.nan,
-                "rocv_preferred_max": np.nan,
             })
             continue
 
@@ -1475,20 +1479,6 @@ def main():
                 "Chosen_AIC": np.nan,
                 "Chosen_BIC": np.nan,
                 "Accepted_by_rules": False
-            })
-            recommended_rows.append({
-                "Product": prod,
-                "Division": div,
-                "Recommended_Model": "INSUFFICIENT_HISTORY",
-                "Reason": f"Insufficient history (<{MIN_OBS_TOTAL} observations).",
-                "baseline_model": None,
-                "baseline_mae": np.nan,
-                "baseline_rocv": np.nan,
-                "mae_cutoff": np.nan,
-                "rmse_cutoff": np.nan,
-                "rocv_hard_max": np.nan,
-                "rocv_preferred_min": np.nan,
-                "rocv_preferred_max": np.nan,
             })
             continue
 
@@ -1904,37 +1894,40 @@ def main():
                 "Skip_Reason": prophet_metrics.get("Skip_Reason", ""),
             })
 
-        # --- Choose best model using recommended logic ---
-        best_model, baseline, selection_reason, decision = choose_recommended_model(metrics_list)
-        flags_by_model = decision.get("flags_by_model", {})
-        for row in ranking_rows:
-            flags = flags_by_model.get(row["Model"], {})
-            row["passes_accuracy"] = flags.get("passes_accuracy")
-            row["passes_rocv_hard"] = flags.get("passes_rocv_hard")
-            row["in_preferred_band"] = flags.get("in_preferred_band")
-            row["Accepted_by_rules"] = bool(
-                flags.get("passes_accuracy") and flags.get("passes_rocv_hard")
-            )
+        # --- Choose best model according to rules ---
+        best_model, baseline = choose_best_model(metrics_list)
+        if (enable_ml or enable_prophet) and baseline is not None:
+            baseline_models = {"SARIMA_baseline", "ETS_baseline"}
+            accepted_models = {
+                m["Model"] for m in metrics_list
+                if m["Model"] not in baseline_models and _candidate_passes_rules(m, baseline)
+            }
+            for row in ranking_rows:
+                row["Accepted_by_rules"] = row["Model"] in accepted_models
 
-        # Identify best SARIMAX candidate by Test_MAE for regressor fallback.
-        sarimax_candidates = [
+        # Identify best non-baseline candidate by weighted MAE.
+        # Prefer a SARIMAX candidate when available so regressor fields populate.
+        non_baseline_candidates = [
             m for m in metrics_list
-            if isinstance(m.get("Model"), str) and m["Model"].startswith("SARIMAX")
-            and not np.isnan(m.get("Test_MAE", np.nan))
+            if m["Model"] not in {"SARIMA_baseline", "ETS_baseline"} and np.isfinite(m.get("Test_WMAE", np.nan))
         ]
-        def mae_rmse_key_local(m):
-            mae = m.get("Test_MAE", np.nan)
+        sarimax_candidates = [
+            m for m in non_baseline_candidates
+            if isinstance(m.get("Model"), str) and m["Model"].startswith("SARIMAX")
+        ]
+        def wmae_rmse_key_local(m):
+            mae = m.get("Test_WMAE", np.nan)
             rmse = m.get("Test_RMSE", np.nan)
-            model_name = str(m.get("Model", ""))
             return (
                 mae if np.isfinite(mae) else np.inf,
                 rmse if np.isfinite(rmse) else np.inf,
-                model_name,
             )
 
         best_nonbaseline = None
         if sarimax_candidates:
-            best_nonbaseline = min(sarimax_candidates, key=mae_rmse_key_local)
+            best_nonbaseline = min(sarimax_candidates, key=wmae_rmse_key_local)
+        elif non_baseline_candidates:
+            best_nonbaseline = min(non_baseline_candidates, key=wmae_rmse_key_local)
 
         if best_model is None:
             print("  -> No valid model metrics; marking as FAILED.")
@@ -1960,20 +1953,6 @@ def main():
                 "Chosen_AIC": np.nan,
                 "Chosen_BIC": np.nan,
                 "Accepted_by_rules": False
-            })
-            recommended_rows.append({
-                "Product": prod,
-                "Division": div,
-                "Recommended_Model": "FAILED",
-                "Reason": "No valid model metrics available.",
-                "baseline_model": None,
-                "baseline_mae": np.nan,
-                "baseline_rocv": np.nan,
-                "mae_cutoff": np.nan,
-                "rmse_cutoff": np.nan,
-                "rocv_hard_max": np.nan,
-                "rocv_preferred_min": np.nan,
-                "rocv_preferred_max": np.nan,
             })
             continue
 
@@ -2063,26 +2042,12 @@ def main():
                 if "_l" in best_nonbaseline_model:
                     best_nonbaseline_reg_lag = int(best_nonbaseline_model.split("_l")[-1])
 
-        accepted_by_rules = bool(baseline is not None and best_model["Model"] != baseline.get("Model"))
+        accepted_by_rules = (best_model["Model"] not in {"SARIMA_baseline", "ETS_baseline"})
 
         print(f"  -> Chosen model: {best_model['Model']}")
         print(f"     Baseline MAE: {baseline_mae:.3f} | Chosen MAE: {chosen_mae:.3f} | Improvement: {mae_improvement_pct * 100 if not np.isnan(mae_improvement_pct) else np.nan:.2f}%")
 
         model_type = _model_type(best_model["Model"]) if (enable_ml or enable_prophet) else None
-        recommended_rows.append({
-            "Product": prod,
-            "Division": div,
-            "Recommended_Model": best_model["Model"],
-            "Reason": selection_reason,
-            "baseline_model": decision.get("baseline_model"),
-            "baseline_mae": decision.get("baseline_mae"),
-            "baseline_rocv": decision.get("baseline_rocv"),
-            "mae_cutoff": decision.get("mae_cutoff"),
-            "rmse_cutoff": decision.get("rmse_cutoff"),
-            "rocv_hard_max": decision.get("rocv_hard_max"),
-            "rocv_preferred_min": decision.get("rocv_preferred_min"),
-            "rocv_preferred_max": decision.get("rocv_preferred_max"),
-        })
         results_rows.append({
             "Product": prod,
             "Division": div,
@@ -2115,7 +2080,6 @@ def main():
     # ===========================
     print("\nWriting Excel summary...")
     df_results = pd.DataFrame(results_rows)
-    df_recommended = pd.DataFrame(recommended_rows)
 
     # Nice ordering of columns
     col_order = [
@@ -2155,28 +2119,9 @@ def main():
             .rank(method="first")
         )
 
-    with pd.ExcelWriter(OUTPUT_FILE) as writer:
+    output_file = _output_path(OUTPUT_FILE)
+    with pd.ExcelWriter(output_file) as writer:
         df_results.to_excel(writer, index=False, sheet_name="Model_Summary")
-        if not df_recommended.empty:
-            recommended_cols = [
-                "Product",
-                "Division",
-                "Recommended_Model",
-                "Reason",
-                "baseline_model",
-                "baseline_mae",
-                "baseline_rocv",
-                "mae_cutoff",
-                "rmse_cutoff",
-                "rocv_hard_max",
-                "rocv_preferred_min",
-                "rocv_preferred_max",
-            ]
-            for col in recommended_cols:
-                if col not in df_recommended.columns:
-                    df_recommended[col] = np.nan
-            df_recommended = df_recommended[recommended_cols]
-            df_recommended.to_excel(writer, index=False, sheet_name="recommended_model_summary")
         if not df_rankings.empty:
             df_rankings.to_excel(writer, index=False, sheet_name="Model_Rankings")
         if skipped_no_order:
@@ -2189,7 +2134,7 @@ def main():
         for row in skipped_no_order:
             print(f"  - Product: {row['Product']}, Division: {row['Division']}")
 
-    print(f"\nDone. Summary written to: {OUTPUT_FILE}")
+    print(f"\nDone. Summary written to: {output_file}")
 
 
 if __name__ == "__main__":

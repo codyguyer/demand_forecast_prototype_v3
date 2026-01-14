@@ -27,6 +27,7 @@ except Exception:
 # CONFIG
 # ===========================
 
+OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 INPUT_FILE = "all_products_with_sf_and_bookings.xlsx"
 REVISED_ACTUALS_FILE = "all_products_with_sf_and_bookings_revised.xlsx"
 REVISED_ACTUALS_SHEET = "Revised Actuals"
@@ -85,6 +86,14 @@ def _build_output_filename(base_name: str, first_forecast_dt: Optional[pd.Timest
         stem, ext = base_name.rsplit(".", 1)
         return f"{stem}_{suffix}.{ext}"
     return f"{base_name}_{suffix}"
+
+
+def _output_path(filename: str) -> str:
+    if not filename:
+        return filename
+    if os.path.isabs(filename) or os.path.dirname(filename):
+        return filename
+    return os.path.join(OUTPUT_DIR, filename)
 
 
 # ===========================
@@ -161,6 +170,7 @@ def mark_prelaunch_actuals_as_missing(
         df = _apply(df)
 
     if output_excel_path:
+        output_excel_path = _output_path(output_excel_path)
         with pd.ExcelWriter(output_excel_path, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name=output_sheet, index=False)
         print(f"Wrote revised actuals to {output_excel_path} ({output_sheet}).")
@@ -220,50 +230,6 @@ def _model_group_from_choice(choice: dict) -> Optional[str]:
     if model_name == "PROPHET":
         return "prophet"
     return None
-
-
-def _apply_recommended_model_flags(
-    fc_df: pd.DataFrame,
-    preferred_group: Optional[str],
-) -> pd.DataFrame:
-    """
-    Mark recommended_model only when the model_status is ok.
-    If the preferred group failed, fall back to the best available ok group.
-    """
-    fc_df = fc_df.copy()
-    fc_df["recommended_model"] = False
-
-    priority = []
-    if preferred_group:
-        priority.append(preferred_group)
-    priority.extend(
-        g
-        for g in ["baseline_sarima", "with_regressor", "baseline_ets", "ml_gbr", "prophet"]
-        if g not in priority
-    )
-
-    for month, group in fc_df.groupby("forecast_month"):
-        chosen_group = None
-        for model_group in priority:
-            ok_rows = group[
-                (group["model_group"] == model_group) & (group["model_status"] == "ok")
-            ]
-            if not ok_rows.empty:
-                chosen_group = model_group
-                break
-
-        if chosen_group is None:
-            ok_any = group[group["model_status"] == "ok"]
-            if not ok_any.empty:
-                chosen_group = ok_any.iloc[0]["model_group"]
-
-        if chosen_group is not None:
-            idx = group[
-                (group["model_group"] == chosen_group) & (group["model_status"] == "ok")
-            ].index
-            fc_df.loc[idx, "recommended_model"] = True
-
-    return fc_df
 
 
 def _parse_order_cell(value, expected_len: int) -> Optional[Tuple[int, ...]]:
@@ -361,21 +327,7 @@ def load_model_choices(path: str) -> Dict[Tuple[str, str], dict]:
     Load chosen model summary per SKU.
     Returns {(Product, Division): {"model": str, "reg_name": str|None, "reg_lag": int|None, "best_nonbaseline": {...}}}
     """
-    xls = pd.ExcelFile(path)
-    if "Model_Summary" in xls.sheet_names:
-        df = pd.read_excel(xls, sheet_name="Model_Summary")
-    else:
-        df = pd.read_excel(xls, sheet_name=xls.sheet_names[0])
-
-    recommended_map = {}
-    if "recommended_model_summary" in xls.sheet_names:
-        df_rec = pd.read_excel(xls, sheet_name="recommended_model_summary")
-        rec_cols = {COL_PRODUCT, COL_DIVISION, "Recommended_Model"}
-        if rec_cols.issubset(df_rec.columns):
-            recommended_map = {
-                (row[COL_PRODUCT], row[COL_DIVISION]): row["Recommended_Model"]
-                for _, row in df_rec.iterrows()
-            }
+    df = pd.read_excel(path)
     required_cols = {COL_PRODUCT, COL_DIVISION, "Chosen_Model"}
     if not required_cols.issubset(df.columns):
         missing = required_cols - set(df.columns)
@@ -415,9 +367,6 @@ def load_model_choices(path: str) -> Dict[Tuple[str, str], dict]:
         prod = row[COL_PRODUCT]
         div = row[COL_DIVISION]
         model_name = row["Chosen_Model"]
-        recommended_name = recommended_map.get((prod, div))
-        if recommended_name is not None and not pd.isna(recommended_name):
-            model_name = recommended_name
         best_non_model = row.get("Best_NonBaseline_Model")
         best_non_reg_name = row.get("Best_NonBaseline_Regressor_Name")
         best_non_reg_lag = row.get("Best_NonBaseline_Regressor_Lag")
@@ -1729,7 +1678,7 @@ def main():
     df_all = aggregate_monthly_duplicates(df_all)
     df_all = mark_prelaunch_actuals_as_missing(
         df_all,
-        output_excel_path=REVISED_ACTUALS_FILE,
+        output_excel_path=_output_path(REVISED_ACTUALS_FILE),
         output_sheet=REVISED_ACTUALS_SHEET,
     )
     df_all[COL_DATE] = pd.to_datetime(df_all[COL_DATE])
@@ -1842,7 +1791,7 @@ def main():
             continue
 
         recommended_group = _model_group_from_choice(choice)
-        fc_df = _apply_recommended_model_flags(fc_df, recommended_group)
+        fc_df["recommended_model"] = fc_df["model_group"] == recommended_group
 
         results_rows.append(fc_df)
         print(f"  Generated {fc_df['model_group'].nunique()} model variants.")
@@ -1870,7 +1819,7 @@ def main():
 
     print("\nWriting combined forecasts...")
     first_fc_dt = pd.to_datetime(all_forecasts["forecast_month"]).min()
-    output_file = _build_output_filename(OUTPUT_FILE_BASE, first_fc_dt)
+    output_file = _output_path(_build_output_filename(OUTPUT_FILE_BASE, first_fc_dt))
     all_forecasts.to_excel(output_file, index=False, sheet_name="Forecast_Library")
     print(f"Done. Saved to {output_file}")
 

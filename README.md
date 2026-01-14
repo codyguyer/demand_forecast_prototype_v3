@@ -53,7 +53,7 @@ python sarima_multi_sku_engine.py
 python sarima_forecast.py
 ```
    - Reads `all_products_with_sf_and_bookings.xlsx`, `sarimax_order_search_summary.xlsx`, and `sarima_multi_sku_summary.xlsx`
-   - Outputs `stats_model_forecasts_YYYY-Mon.xlsx`
+   - Outputs `stats_model_forecasts_YYYY-Mon.xlsx` with a password of "gopackgo"
 
 ## Model logic and assumptions (new analyst guide)
 
@@ -134,17 +134,69 @@ Prophet challenger (optional):
 - Requires `prophet` to be installed and at least 24 months of usable history.
 - ROCV uses 1-step horizons with a minimum training length of 24.
 
-Model acceptance rules:
-- Baseline is the better of SARIMA vs ETS by Test MAE (ties broken by RMSE).
-- A non-baseline candidate must satisfy BOTH:
-  - Test MAE improves baseline by at least 2% (`EPSILON_IMPROVEMENT = 0.02`).
-  - ROCV MAE is not more than 5% worse than baseline (`DELTA_ROCV_TOLERANCE = 0.05`).
-- If candidate ROCV is NaN but baseline ROCV is valid, the candidate is rejected.
-- If no candidate passes, the baseline is selected.
+Recommended model selection (new logic):
+We anchor model selection on the most accurate forecast, and only deviate from it when another model is similarly accurate and exhibits believable demand variability.
+
+Inputs per candidate row:
+- `Product`, `Division`, `Model`
+- `Test_MAE`, `Test_RMSE`
+- `ROCV_MAE` (variability proxy; higher = more volatile)
+
+Step 1: Baseline model (most accurate)
+- `baseline_model` = model with lowest `Test_MAE`
+- `baseline_mae`, `baseline_rmse`, `baseline_rocv` are captured for thresholds
+- Baseline is always considered valid
+
+Step 2: Accuracy gate (relative to baseline)
+- `mae_cutoff = baseline_mae * (1 + mae_tolerance)`
+- `rmse_cutoff = baseline_rmse * (1 + rmse_tolerance)`
+- Defaults: `mae_tolerance = 0.20`, `rmse_tolerance = 0.20`
+- `passes_accuracy = (Test_MAE <= mae_cutoff) AND (Test_RMSE <= rmse_cutoff)`
+- Baseline always passes
+
+Step 3: ROCV hard-stop (variability sanity)
+- `rocv_hard_max = baseline_rocv * rocv_hard_multiplier`
+- Default: `rocv_hard_multiplier = 1.50`
+- `passes_rocv_hard = (ROCV_MAE <= rocv_hard_max)`
+- Baseline always passes
+
+Step 4: Candidate set
+- `candidates = passes_accuracy AND passes_rocv_hard`
+- If empty, recommend baseline
+  - Reason: "No alternative model met accuracy and variability sanity thresholds; selected lowest-MAE baseline."
+
+Step 5: Variability preference band (among candidates)
+- `rocv_preferred_min = baseline_rocv * rocv_preferred_lower`
+- `rocv_preferred_max = baseline_rocv * rocv_preferred_upper`
+- Defaults: `rocv_preferred_lower = 0.85`, `rocv_preferred_upper = 1.15`
+- `preferred_candidates = candidates with ROCV_MAE in [min, max]`
+
+Step 6: Selection
+- If `preferred_candidates` non-empty:
+  - choose lowest `Test_MAE`
+  - tie-breakers: lower `Test_RMSE`, then alphabetical `Model`
+  - Reason: "Selected among accurate models with variability aligned to the baseline forecast."
+- Else:
+  - choose lowest `Test_MAE` from candidates
+  - Reason: "Selected most accurate model among those passing variability sanity checks."
+
+Step 7: Final safeguard
+- If selected is not baseline and ROCV is extreme vs baseline:
+  - too smooth: `ROCV_MAE < baseline_rocv * rocv_too_smooth` (default 0.70)
+  - too noisy: `ROCV_MAE > baseline_rocv * rocv_too_noisy` (default 1.5)
+- Revert to baseline with explicit fallback reason
+
+Outputs (summary and debug):
+- `Product`, `Division`, `Recommended_Model`, `Reason`
+- `baseline_model`, `baseline_mae`, `baseline_rocv`
+- `mae_cutoff`, `rmse_cutoff`
+- `rocv_hard_max`, `rocv_preferred_min`, `rocv_preferred_max`
+- Optional per-model flags: `passes_accuracy`, `passes_rocv_hard`, `in_preferred_band`
 
 Outputs:
 - `sarima_multi_sku_summary.xlsx` contains the chosen model, baseline metrics, improvement %, and selected regressor name/lag.
-- `Model_Rankings` sheet includes all candidates and whether each passed the acceptance rules.
+- `Model_Rankings` sheet includes all candidates and whether each passed the accuracy and ROCV gates.
+- `recommended_model_summary` sheet includes the recommended model, reason, and threshold fields used by the new selection logic.
 
 ### 3) Forecast generation (`sarima_forecast.py`)
 Purpose: generate forecast variants for each SKU and flag the recommended model from the summary file.

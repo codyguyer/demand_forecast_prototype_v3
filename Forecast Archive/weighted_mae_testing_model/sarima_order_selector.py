@@ -1,3 +1,4 @@
+import os
 import warnings
 import time
 from typing import List, Optional, Tuple
@@ -14,6 +15,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # --------------------------------------------------
 # CONFIG
 # --------------------------------------------------
+OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 SEASONAL_PERIOD = 12  # monthly data with annual seasonality
 DEFAULT_D = 1
 DEFAULT_D_SEASONAL = 1
@@ -31,6 +33,14 @@ TOP_N_CANDIDATES = 5
 HOLDOUT_HORIZON = 12
 MIN_TRAIN_FOR_HOLDOUT = 24
 MIN_SERIES_LENGTH = 30  # guardrail to skip very short series
+
+
+def _output_path(filename: str) -> str:
+    if not filename:
+        return filename
+    if os.path.isabs(filename) or os.path.dirname(filename):
+        return filename
+    return os.path.join(OUTPUT_DIR, filename)
 
 
 # --------------------------------------------------
@@ -422,8 +432,9 @@ if __name__ == "__main__":
         target_col="Actuals",
         exog_cols=exog_columns,
     )
-    summary.to_excel("sarimax_order_search_summary.xlsx", index=False)
-    print("Saved sarimax_order_search_summary.xlsx")
+    output_path = _output_path("sarimax_order_search_summary.xlsx")
+    summary.to_excel(output_path, index=False)
+    print(f"Saved {output_path}")
     elapsed = time.perf_counter() - t0
     minutes = elapsed / 60.0
     print(f"Total runtime: {elapsed:,.2f} seconds ({minutes:,.2f} minutes)")
