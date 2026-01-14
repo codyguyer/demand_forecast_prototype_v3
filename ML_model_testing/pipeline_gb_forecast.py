@@ -11,11 +11,6 @@ from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_squared_error
 
-try:
-    from statsmodels.tsa.statespace.sarimax import SARIMAX
-except Exception:
-    SARIMAX = None
-
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -51,8 +46,9 @@ def parse_snapshot_month(series: pd.Series) -> pd.Series:
     raw = series.astype(str).str.strip()
     dt = pd.to_datetime(raw, format="%Y-%m", errors="coerce")
     if dt.isna().any():
-        dt2 = pd.to_datetime(raw, errors="coerce")
-        dt = dt.fillna(dt2)
+        mask = dt.isna()
+        dt2 = pd.to_datetime(raw[mask], errors="coerce")
+        dt.loc[mask] = dt2
     return dt.dt.to_period("M").dt.to_timestamp()
 
 
@@ -60,8 +56,9 @@ def parse_close_date(series: pd.Series) -> pd.Series:
     raw = series.astype(str).str.strip()
     dt = pd.to_datetime(raw, format="%m/%d/%Y", errors="coerce")
     if dt.isna().any():
-        dt2 = pd.to_datetime(raw, errors="coerce")
-        dt = dt.fillna(dt2)
+        mask = dt.isna()
+        dt2 = pd.to_datetime(raw[mask], errors="coerce")
+        dt.loc[mask] = dt2
     return dt.dt.to_period("M").dt.to_timestamp()
 
 
@@ -140,22 +137,45 @@ def normalize_code(value: object) -> str:
     return raw
 
 
-def load_actuals(product_id: str, division: str) -> pd.DataFrame:
-    df = pd.read_excel(ACTUALS_PATH)
-    df = aggregate_monthly_actuals(df)
-    prod_str = df["Product"].apply(normalize_code)
-    div_str = df["Division"].astype(str)
+def load_actuals(
+    product_id: str,
+    division: str,
+    actuals_all: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    if actuals_all is None:
+        df = pd.read_excel(ACTUALS_PATH)
+        df = aggregate_monthly_actuals(df)
+    else:
+        df = actuals_all
+    prod_str = (
+        df["Product_norm"] if "Product_norm" in df.columns else df["Product"].apply(normalize_code)
+    )
+    div_str = (
+        df["Division_str"] if "Division_str" in df.columns else df["Division"].astype(str)
+    )
     df = df[(prod_str == normalize_code(product_id)) & (div_str == str(division))].copy()
+    df = df.drop(columns=["Product_norm", "Division_str"], errors="ignore")
     df = mark_prelaunch_actuals_as_missing(df)
     return df
 
 
-def load_feature_mode(product_id: str, division: str) -> str:
-    catalog = pd.read_excel(PRODUCT_CATALOG_PATH)
-    match = catalog[
-        (catalog["group_key"].astype(str) == normalize_code(product_id))
-        & (catalog["business_unit_code"].astype(str) == division)
-    ]
+def load_feature_mode(
+    product_id: str,
+    division: str,
+    catalog: pd.DataFrame | None = None,
+) -> str:
+    catalog = pd.read_excel(PRODUCT_CATALOG_PATH) if catalog is None else catalog
+    group_key = (
+        catalog["group_key_norm"]
+        if "group_key_norm" in catalog.columns
+        else catalog["group_key"].astype(str).apply(normalize_code)
+    )
+    business_unit = (
+        catalog["business_unit_code_str"]
+        if "business_unit_code_str" in catalog.columns
+        else catalog["business_unit_code"].astype(str)
+    )
+    match = catalog[(group_key == normalize_code(product_id)) & (business_unit == division)]
     if match.empty or "salesforce_feature_mode" not in match.columns:
         raise RuntimeError(
             f"salesforce_feature_mode not found for product {product_id} / {division}."
@@ -224,43 +244,93 @@ def filter_pipeline_product(
         codes.update(normalize_code(code) for code in sf_codes if normalize_code(code))
 
     if "Product Code" in df.columns:
-        product_codes = pd.to_numeric(df["Product Code"], errors="coerce")
+        product_codes = (
+            df["Product_Code_num"]
+            if "Product_Code_num" in df.columns
+            else pd.to_numeric(df["Product Code"], errors="coerce")
+        )
         numeric_codes = []
         for code in codes:
             if code.replace(".", "", 1).isdigit():
                 numeric_codes.append(float(code))
         if numeric_codes:
             product_mask |= product_codes.isin(numeric_codes)
-        product_mask |= df["Product Code"].apply(normalize_code).isin(codes)
+        product_norm = (
+            df["Product_Code_norm"]
+            if "Product_Code_norm" in df.columns
+            else df["Product Code"].apply(normalize_code)
+        )
+        product_mask |= product_norm.isin(codes)
     if "Current OSC Product Name" in df.columns:
-        product_mask |= df["Current OSC Product Name"].apply(normalize_code).isin(codes)
+        name_norm = (
+            df["Current_OSC_Product_Name_norm"]
+            if "Current_OSC_Product_Name_norm" in df.columns
+            else df["Current OSC Product Name"].apply(normalize_code)
+        )
+        product_mask |= name_norm.isin(codes)
     return df[product_mask].copy()
 
 
 def load_pipeline_history(
-    product_id: str, division: str, sf_codes: list[str] | None = None
+    product_id: str,
+    division: str,
+    sf_codes: list[str] | None = None,
+    pipeline_all: pd.DataFrame | None = None,
+    pipeline_preprocessed: bool = False,
 ) -> pd.DataFrame:
     frames = []
     slip_frames = []
-    for path in PIPELINE_FILES:
-        df = pd.read_excel(path)
+
+    if pipeline_all is None:
+        sources: list[pd.DataFrame] = []
+        for path in PIPELINE_FILES:
+            sources.append(pd.read_excel(path))
+    elif "_source_file" in pipeline_all.columns:
+        sources = [
+            pipeline_all[pipeline_all["_source_file"] == source].copy()
+            for source in pipeline_all["_source_file"].dropna().unique()
+        ]
+    else:
+        sources = [pipeline_all.copy()]
+
+    for df in sources:
         if "Business Unit" in df.columns:
             df = df[df["Business Unit"] == division]
         df = filter_pipeline_product(df, product_id, sf_codes=sf_codes)
-        df["snapshot_month"] = parse_snapshot_month(df["Month"])
-        df["target_month"] = parse_close_date(df["Close Date"])
-        df = df.dropna(subset=["target_month"])
+        if df.empty:
+            continue
+        if not pipeline_preprocessed:
+            if "snapshot_month" not in df.columns and "Month" in df.columns:
+                df["snapshot_month"] = parse_snapshot_month(df["Month"])
+            if "target_month" not in df.columns and "Close Date" in df.columns:
+                df["target_month"] = parse_close_date(df["Close Date"])
+            if "Probability" in df.columns:
+                df["Probability"] = pd.to_numeric(df["Probability"], errors="coerce")
+            if "Total Price" in df.columns:
+                df["Total Price"] = pd.to_numeric(df["Total Price"], errors="coerce")
+            if "Factored Quantity" in df.columns:
+                df["Factored Quantity"] = pd.to_numeric(df["Factored Quantity"], errors="coerce")
+            if "Factored Revenue" in df.columns:
+                df["Factored Revenue"] = pd.to_numeric(df["Factored Revenue"], errors="coerce")
+            if "Quantity" in df.columns:
+                df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce")
+            if "Quantity W/ Decimal" in df.columns:
+                df["Quantity W/ Decimal"] = pd.to_numeric(
+                    df["Quantity W/ Decimal"], errors="coerce"
+                )
 
-        quantity_col = "Quantity" if "Quantity" in df.columns else "Quantity W/ Decimal"
-        df[quantity_col] = pd.to_numeric(df[quantity_col], errors="coerce")
-        if "Probability" in df.columns:
-            df["Probability"] = pd.to_numeric(df["Probability"], errors="coerce")
-        if "Total Price" in df.columns:
-            df["Total Price"] = pd.to_numeric(df["Total Price"], errors="coerce")
-        if "Factored Quantity" in df.columns:
-            df["Factored Quantity"] = pd.to_numeric(df["Factored Quantity"], errors="coerce")
-        if "Factored Revenue" in df.columns:
-            df["Factored Revenue"] = pd.to_numeric(df["Factored Revenue"], errors="coerce")
+        if "target_month" in df.columns:
+            df = df.dropna(subset=["target_month"])
+        else:
+            continue
+
+        quantity_col = None
+        if "Quantity" in df.columns and df["Quantity"].notna().any():
+            quantity_col = "Quantity"
+        elif "Quantity W/ Decimal" in df.columns and df["Quantity W/ Decimal"].notna().any():
+            quantity_col = "Quantity W/ Decimal"
+        else:
+            quantity_col = "Quantity" if "Quantity" in df.columns else "Quantity W/ Decimal"
 
         if "Probability" in df.columns:
             prob = df["Probability"] / 100.0
@@ -315,12 +385,10 @@ def load_pipeline_history(
         slip_all = slip_all.dropna(subset=["snapshot_month", "target_month", "opp_key"])
         slip_all = slip_all.sort_values(["opp_key", "snapshot_month"])
         slip_all["prior_target_month"] = slip_all.groupby("opp_key")["target_month"].shift(1)
-        slip_all["slip_months"] = slip_all.apply(
-            lambda x: month_diff(x["target_month"], x["prior_target_month"])
-            if pd.notna(x["prior_target_month"])
-            else np.nan,
-            axis=1,
-        )
+        prior = slip_all["prior_target_month"]
+        curr = slip_all["target_month"]
+        slip_months = (curr.dt.year - prior.dt.year) * 12 + (curr.dt.month - prior.dt.month)
+        slip_all["slip_months"] = slip_months.where(prior.notna(), np.nan)
         slip_stats = slip_all.groupby("snapshot_month")["slip_months"].median()
         slippage_months_by_snapshot = slip_stats.to_dict()
 
@@ -485,6 +553,7 @@ def build_feature_frame(
             if avg_actuals_12 and not np.isnan(avg_actuals_12)
             else np.nan
         )
+        summary_payload = {f"summary_{key}": summary_row.get(key, np.nan) for key in summary_cols}
 
         trend_idx = month_diff(snapshot_for_lags, first_month)
 
@@ -563,17 +632,6 @@ def build_feature_frame(
                 if avg_actuals_12 and not np.isnan(avg_actuals_12)
                 else np.nan
             )
-            summary_primary = (
-                summary_row.get("Sum_Quantity")
-                if feature_mode == "quantity"
-                else summary_row.get("Sum_Total_Price")
-            )
-            summary_primary_coverage = (
-                summary_primary / avg_actuals_12
-                if avg_actuals_12 and not np.isnan(avg_actuals_12)
-                else np.nan
-            )
-
             target_actual = actuals_series.get(target_month)
             if pd.isna(target_actual):
                 continue
@@ -629,7 +687,7 @@ def build_feature_frame(
                     "slippage_months": snap_metrics.get("slippage_months", np.nan),
                     "summary_primary": summary_primary,
                     "summary_primary_coverage": summary_primary_coverage,
-                    **{f"summary_{key}": summary_row.get(key, np.nan) for key in summary_cols},
+                    **summary_payload,
                     "actuals": target_actual,
                 }
             )
@@ -821,6 +879,7 @@ def build_future_frame(
             if (summary_df["Month"] == snapshot_month).any()
             else {}
         )
+    summary_payload = {f"summary_{col}": summary_row.get(col, np.nan) for col in summary_cols}
 
     if feature_mode == "quantity":
         current_pipeline["pipeline_primary"] = current_pipeline["pipeline_factored_qty"]
@@ -864,6 +923,30 @@ def build_future_frame(
             current_pipeline.loc[slip_mask, "pipeline_primary"].sum()
         )
 
+    lag_months = [snapshot_for_lags - pd.DateOffset(months=i) for i in range(0, 12)]
+    lag_values = [
+        np.nan if actuals_series.get(m) is None else actuals_series.get(m) for m in lag_months
+    ]
+    lag_1 = lag_values[0]
+    lag_2 = lag_values[1] if len(lag_values) > 1 else np.nan
+    lag_3 = lag_values[2] if len(lag_values) > 2 else np.nan
+
+    roll_mean_3 = safe_nanmean(lag_values[:3])
+    roll_mean_6 = safe_nanmean(lag_values[:6])
+    roll_mean_12 = safe_nanmean(lag_values[:12])
+    avg_actuals_12 = roll_mean_12
+
+    summary_primary = (
+        summary_row.get("Sum_Quantity")
+        if feature_mode == "quantity"
+        else summary_row.get("Sum_Total_Price")
+    )
+    summary_primary_coverage = (
+        summary_primary / avg_actuals_12
+        if avg_actuals_12 and not np.isnan(avg_actuals_12)
+        else np.nan
+    )
+
     rows = []
     for i in range(1, FORECAST_HORIZON + 1):
         target_month = last_actual_month + pd.DateOffset(months=i)
@@ -887,31 +970,6 @@ def build_future_frame(
             float(pipeline_row["pipeline_stage_weighted_revenue"])
             if pipeline_row is not None
             else 0.0
-        )
-
-        lag_months = [snapshot_for_lags - pd.DateOffset(months=i) for i in range(0, 12)]
-        lag_values = [
-            np.nan if actuals_series.get(m) is None else actuals_series.get(m)
-            for m in lag_months
-        ]
-        lag_1 = lag_values[0]
-        lag_2 = lag_values[1] if len(lag_values) > 1 else np.nan
-        lag_3 = lag_values[2] if len(lag_values) > 2 else np.nan
-
-        roll_mean_3 = safe_nanmean(lag_values[:3])
-        roll_mean_6 = safe_nanmean(lag_values[:6])
-        roll_mean_12 = safe_nanmean(lag_values[:12])
-        avg_actuals_12 = roll_mean_12
-
-        summary_primary = (
-            summary_row.get("Sum_Quantity")
-            if feature_mode == "quantity"
-            else summary_row.get("Sum_Total_Price")
-        )
-        summary_primary_coverage = (
-            summary_primary / avg_actuals_12
-            if avg_actuals_12 and not np.isnan(avg_actuals_12)
-            else np.nan
         )
 
         pipeline_primary = (
@@ -998,11 +1056,7 @@ def build_future_frame(
                 "slippage_months": slip_months,
                 "summary_primary": summary_primary,
                 "summary_primary_coverage": summary_primary_coverage,
-                **{
-                    f"summary_{col}": summary_row.get(col, np.nan)
-                    for col in summary_cols
-                    if col not in {"Month", "group_key", "BU"}
-                },
+                **summary_payload,
             }
         )
 
@@ -1043,6 +1097,58 @@ def main() -> None:
     all_sf_pipeline_check = []
     skipped_products: list[dict[str, object]] = []
     holdout_results: list[dict[str, object]] = []
+    actuals_all_raw = pd.read_excel(ACTUALS_PATH)
+    actuals_all = aggregate_monthly_actuals(actuals_all_raw)
+    actuals_all["Product_norm"] = actuals_all["Product"].apply(normalize_code)
+    actuals_all["Division_str"] = actuals_all["Division"].astype(str)
+
+    catalog = pd.read_excel(PRODUCT_CATALOG_PATH)
+    if "group_key" in catalog.columns:
+        catalog["group_key_norm"] = catalog["group_key"].apply(normalize_code)
+    if "business_unit_code" in catalog.columns:
+        catalog["business_unit_code_str"] = catalog["business_unit_code"].astype(str)
+
+    pipeline_all = pd.DataFrame()
+    if PIPELINE_FILES:
+        pipeline_frames = []
+        for path in PIPELINE_FILES:
+            df = pd.read_excel(path)
+            df["_source_file"] = path.name
+            pipeline_frames.append(df)
+        pipeline_all = pd.concat(pipeline_frames, ignore_index=True)
+    if not pipeline_all.empty:
+        if "Month" in pipeline_all.columns and "snapshot_month" not in pipeline_all.columns:
+            pipeline_all["snapshot_month"] = parse_snapshot_month(pipeline_all["Month"])
+        if "Close Date" in pipeline_all.columns and "target_month" not in pipeline_all.columns:
+            pipeline_all["target_month"] = parse_close_date(pipeline_all["Close Date"])
+        numeric_cols = [
+            "Quantity",
+            "Quantity W/ Decimal",
+            "Probability",
+            "Total Price",
+            "Factored Quantity",
+            "Factored Revenue",
+        ]
+        for col in numeric_cols:
+            if col in pipeline_all.columns:
+                pipeline_all[col] = pd.to_numeric(pipeline_all[col], errors="coerce")
+        if "Product Code" in pipeline_all.columns:
+            pipeline_all["Product_Code_num"] = pd.to_numeric(
+                pipeline_all["Product Code"], errors="coerce"
+            )
+            pipeline_all["Product_Code_norm"] = pipeline_all["Product Code"].apply(
+                normalize_code
+            )
+        if "Current OSC Product Name" in pipeline_all.columns:
+            pipeline_all["Current_OSC_Product_Name_norm"] = pipeline_all[
+                "Current OSC Product Name"
+            ].apply(normalize_code)
+    pipeline_preprocessed = (
+        not pipeline_all.empty
+        and "snapshot_month" in pipeline_all.columns
+        and "target_month" in pipeline_all.columns
+    )
+
     summary_path = resolve_summary_path()
     summary_full = load_summary_report(summary_path) if summary_path else pd.DataFrame()
     sf_reference = load_sf_product_reference()
@@ -1068,8 +1174,9 @@ def main() -> None:
             (normalize_code(product_id), div) for product_id in PRODUCT_IDS for div in divisions
         ]
     else:
-        actuals_all = pd.read_excel(ACTUALS_PATH)
-        pairs = actuals_all[["Product", "Division"]].dropna(subset=["Product", "Division"])
+        pairs = actuals_all_raw[["Product", "Division"]].dropna(
+            subset=["Product", "Division"]
+        )
         pairs["Product"] = pairs["Product"].apply(normalize_code)
         pairs["Division"] = pairs["Division"].astype(str)
         pairs = pairs[pairs["Product"] != ""]
@@ -1087,7 +1194,7 @@ def main() -> None:
         try:
             sf_codes = sf_code_map.get((product_id, division), [])
             has_sf_reference = bool(sf_codes)
-            actuals = load_actuals(product_id, division)
+            actuals = load_actuals(product_id, division, actuals_all=actuals_all)
             actuals_series = actuals.set_index("Month")["Actuals"].sort_index()
             actuals_clean = actuals_series.dropna()
             if actuals_clean.empty:
@@ -1095,8 +1202,14 @@ def main() -> None:
                     f"No actuals available after prelaunch adjustment for {product_id}/{division}."
                 )
 
-            feature_mode = load_feature_mode(product_id, division)
-            pipeline_history = load_pipeline_history(product_id, division, sf_codes=sf_codes)
+            feature_mode = load_feature_mode(product_id, division, catalog=catalog)
+            pipeline_history = load_pipeline_history(
+                product_id,
+                division,
+                sf_codes=sf_codes,
+                pipeline_all=pipeline_all,
+                pipeline_preprocessed=pipeline_preprocessed,
+            )
             summary_product = filter_summary_product(summary_full, product_id, division)
             has_pipeline = not pipeline_history.empty
             all_sf_pipeline_check.append(
@@ -1166,27 +1279,6 @@ def main() -> None:
                 np.sqrt(mean_squared_error(holdout_pred["actuals"], holdout_pred["final_pred"]))
             ) if not holdout_pred.empty else np.nan
 
-            aic = np.nan
-            bic = np.nan
-            is_target_product = normalize_code(product_id) == "224" and str(division) == "D100"
-            if is_target_product and SARIMAX is not None:
-                train_series = actuals_series[actuals_series.index < holdout_start].dropna()
-                if not train_series.empty:
-                    try:
-                        sarima = SARIMAX(
-                            train_series,
-                            order=(2, 1, 0),
-                            seasonal_order=(0, 1, 0, 12),
-                            enforce_stationarity=False,
-                            enforce_invertibility=False,
-                        )
-                        sarima_fit = sarima.fit(disp=False)
-                        aic = float(sarima_fit.aic)
-                        bic = float(sarima_fit.bic)
-                    except Exception:
-                        aic = np.nan
-                        bic = np.nan
-
             holdout_results.append(
                 {
                     "product_id": product_id,
@@ -1196,8 +1288,6 @@ def main() -> None:
                     "holdout_mae": holdout_mae,
                     "holdout_rmse": holdout_rmse,
                     "rocv_mae": rocv_mae,
-                    "sarima_aic": aic,
-                    "sarima_bic": bic,
                     "holdout_rows": int(len(holdout_pred)),
                 }
             )
