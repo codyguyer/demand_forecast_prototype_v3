@@ -5,7 +5,9 @@ warnings.filterwarnings("ignore", category=UserWarning)
 import ast
 import os
 import time
-from typing import List, Optional
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
 import argparse
 import numpy as np
 import pandas as pd
@@ -14,6 +16,8 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
 try:
     from prophet import Prophet
     PROPHET_AVAILABLE = True
@@ -25,14 +29,30 @@ except Exception:
 # 1. CONFIG
 # ===========================
 
-INPUT_FILE = "all_products_with_sf_and_bookings.xlsx"  # <--- change to your file
-REVISED_ACTUALS_FILE = "all_products_with_sf_and_bookings_revised.xlsx"
+BASE_DIR = Path(__file__).resolve().parent
+SALESFORCE_DATA_DIR = BASE_DIR / "salesforce_data"
+
+INPUT_FILE = "all_products_actuals_and_bookings.xlsx"  # <--- change to your file
+REVISED_ACTUALS_FILE = "all_products_actuals_and_bookings_revised.xlsx"
 REVISED_ACTUALS_SHEET = "Revised Actuals"
 OUTPUT_FILE = "sarima_multi_sku_summary.xlsx"
+OUTPUT_DIR = BASE_DIR / "data_storage"
+HOLDOUT_TS_CSV = OUTPUT_DIR / "holdout_forecast_actuals.csv"
+HOLDOUT_TS_SHEET = "Holdout_Forecast_Actuals"
 ORDER_FILE = "sarimax_order_search_summary.xlsx"       # per-SKU SARIMA orders
 NOTES_FILE = "Notes.xlsx"                              # manual order overrides
 ENABLE_ML_CHALLENGER = True
 ENABLE_PROPHET_CHALLENGER = True
+PIPELINE_FILES = sorted(SALESFORCE_DATA_DIR.glob("Merged Salesforce Pipeline *.xlsx"))
+SUMMARY_REPORT_NAME = "Salesforce Pipeline Monthly Summary.xlsx"
+SUMMARY_PATH = SALESFORCE_DATA_DIR / SUMMARY_REPORT_NAME
+PRODUCT_CATALOG_PATH = BASE_DIR / "product_catalog_master.xlsx"
+SF_PRODUCT_REFERENCE_PATHS = [
+    SALESFORCE_DATA_DIR / "sf_product_reference_key.csv",
+    BASE_DIR / "sf_product_reference_key.csv",
+    BASE_DIR / "ML_model_testing" / "sf_product_reference_key.csv",
+]
+PIPELINE_ML_MODEL_NAME = "ML_GBR_PIPELINE"
 
 # Column names – adjust if your master file uses different names
 COL_PRODUCT = "Product"
@@ -61,6 +81,9 @@ ROCV_PREFERRED_LOWER = 0.85
 ROCV_PREFERRED_UPPER = 1.15
 ROCV_TOO_SMOOTH = 0.70
 ROCV_TOO_NOISY = 1.5
+DA_MIN_PERIODS = 6
+DA_IMPROVEMENT_PP = 0.10
+DA_CLOSE_MAE_TOL = 0.05
 BASELINE_MAE_ZERO_EPS = 1e-9  # treat MAE at or below this as effectively zero
 ETS_SEASONAL_PERIODS = 12     # monthly data
 
@@ -73,6 +96,11 @@ def _parse_args():
     parser = argparse.ArgumentParser(description="Multi-SKU SARIMA/SARIMAX/ETS/ML evaluation engine")
     parser.add_argument("--disable-ml", action="store_true", help="Disable ML challenger evaluation")
     parser.add_argument("--disable-prophet", action="store_true", help="Disable Prophet challenger evaluation")
+    parser.add_argument(
+        "--compare-model-selection",
+        action="store_true",
+        help="Generate old vs new model selection comparison reports after the run.",
+    )
     return parser.parse_args()
 
 
@@ -174,10 +202,768 @@ def safe_rmse(y_true, y_pred):
     return np.sqrt(mse)
 
 
+def _build_holdout_df(product, division, model, dates, actuals, forecasts) -> pd.DataFrame:
+    df = pd.DataFrame({
+        COL_PRODUCT: product,
+        COL_DIVISION: division,
+        "Model": model,
+        "Date": pd.to_datetime(dates, errors="coerce"),
+        "Actual": pd.to_numeric(actuals, errors="coerce"),
+        "Forecast": pd.to_numeric(forecasts, errors="coerce"),
+    })
+    return df[[COL_PRODUCT, COL_DIVISION, "Model", "Date", "Actual", "Forecast"]]
+
+
+@dataclass
+class ModelBundle:
+    adjustment_model: Optional[Pipeline]
+    adjustment_features: List[str]
+
+
+def month_start(series: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(series, errors="coerce")
+    return dt.dt.to_period("M").dt.to_timestamp()
+
+
+def parse_snapshot_month(series: pd.Series) -> pd.Series:
+    raw = series.astype(str).str.strip()
+    dt = pd.to_datetime(raw, format="%Y-%m", errors="coerce")
+    if dt.isna().any():
+        mask = dt.isna()
+        dt2 = pd.to_datetime(raw[mask], errors="coerce")
+        dt.loc[mask] = dt2
+    return dt.dt.to_period("M").dt.to_timestamp()
+
+
+def parse_close_date(series: pd.Series) -> pd.Series:
+    raw = series.astype(str).str.strip()
+    dt = pd.to_datetime(raw, format="%m/%d/%Y", errors="coerce")
+    if dt.isna().any():
+        mask = dt.isna()
+        dt2 = pd.to_datetime(raw[mask], errors="coerce")
+        dt.loc[mask] = dt2
+    return dt.dt.to_period("M").dt.to_timestamp()
+
+
+def month_diff(later: pd.Timestamp, earlier: pd.Timestamp) -> int:
+    return (later.year - earlier.year) * 12 + (later.month - earlier.month)
+
+
+def safe_nanmean(values: List[Optional[Union[float, int]]]) -> float:
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return np.nan
+    if np.isnan(arr).all():
+        return np.nan
+    return float(np.nanmean(arr))
+
+
+def normalize_code(value: object) -> str:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return str(value).strip()
+    raw = str(value).strip()
+    if raw.endswith(".0") and raw.replace(".", "", 1).isdigit():
+        raw = raw[:-2]
+    return raw
+
+
+def load_feature_mode(product_id: str, division: str, catalog: pd.DataFrame) -> str:
+    group_key = (
+        catalog["group_key_norm"]
+        if "group_key_norm" in catalog.columns
+        else catalog["group_key"].astype(str).apply(normalize_code)
+    )
+    business_unit = (
+        catalog["business_unit_code_str"]
+        if "business_unit_code_str" in catalog.columns
+        else catalog["business_unit_code"].astype(str)
+    )
+    match = catalog[(group_key == normalize_code(product_id)) & (business_unit == division)]
+    if match.empty or "salesforce_feature_mode" not in match.columns:
+        raise RuntimeError(
+            f"salesforce_feature_mode not found for product {product_id} / {division}."
+        )
+    mode_raw = str(match.iloc[0]["salesforce_feature_mode"]).strip().lower()
+    if mode_raw == "dollars":
+        mode_raw = "revenue"
+    if mode_raw not in {"quantity", "revenue"}:
+        raise RuntimeError(f"Unsupported salesforce_feature_mode: {mode_raw}")
+    return mode_raw
+
+
+def load_sf_product_reference() -> pd.DataFrame:
+    for path in SF_PRODUCT_REFERENCE_PATHS:
+        if path.exists():
+            df = pd.read_csv(path)
+            required = {"business_unit_code", "group_key", "salesforce_product_name"}
+            if not required.issubset(set(df.columns)):
+                raise RuntimeError(
+                    "sf_product_reference_key.csv missing required columns: "
+                    f"{', '.join(sorted(required))}."
+                )
+            df["business_unit_code"] = df["business_unit_code"].astype(str)
+            df["group_key"] = df["group_key"].apply(normalize_code)
+            df["salesforce_product_name"] = df["salesforce_product_name"].apply(normalize_code)
+            df = df[df["group_key"] != ""]
+            return df
+    return pd.DataFrame()
+
+
+def load_summary_report(path: Path) -> pd.DataFrame:
+    df = pd.read_excel(path, dtype={"group_key": str, "BU": str})
+    if "Month" in df.columns:
+        df["Month"] = month_start(df["Month"])
+    df["group_key"] = df["group_key"].apply(normalize_code)
+    df["BU"] = df["BU"].astype(str)
+    return df
+
+
+def filter_summary_product(df: pd.DataFrame, product_id: str, division: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    product_key = normalize_code(product_id)
+    division_key = str(division)
+    product_mask = df["group_key"].apply(normalize_code) == product_key
+    division_mask = df["BU"].astype(str) == division_key
+    return df[product_mask & division_mask].copy()
+
+
+def filter_pipeline_product(
+    df: pd.DataFrame, product_id: str, sf_codes: Optional[List[str]] = None
+) -> pd.DataFrame:
+    product_mask = pd.Series([False] * len(df), index=df.index)
+    codes = {normalize_code(product_id)}
+    if sf_codes:
+        codes.update(normalize_code(code) for code in sf_codes if normalize_code(code))
+
+    if "Product Code" in df.columns:
+        product_codes = (
+            df["Product_Code_num"]
+            if "Product_Code_num" in df.columns
+            else pd.to_numeric(df["Product Code"], errors="coerce")
+        )
+        numeric_codes = []
+        for code in codes:
+            if code.replace(".", "", 1).isdigit():
+                numeric_codes.append(float(code))
+        if numeric_codes:
+            product_mask |= product_codes.isin(numeric_codes)
+        product_norm = (
+            df["Product_Code_norm"]
+            if "Product_Code_norm" in df.columns
+            else df["Product Code"].apply(normalize_code)
+        )
+        product_mask |= product_norm.isin(codes)
+    if "Current OSC Product Name" in df.columns:
+        name_norm = (
+            df["Current_OSC_Product_Name_norm"]
+            if "Current_OSC_Product_Name_norm" in df.columns
+            else df["Current OSC Product Name"].apply(normalize_code)
+        )
+        product_mask |= name_norm.isin(codes)
+    return df[product_mask].copy()
+
+
+def load_pipeline_history(
+    product_id: str,
+    division: str,
+    sf_codes: Optional[List[str]] = None,
+    pipeline_all: Optional[pd.DataFrame] = None,
+    pipeline_preprocessed: bool = False,
+) -> pd.DataFrame:
+    frames = []
+    slip_frames = []
+
+    if pipeline_all is None:
+        sources: List[pd.DataFrame] = []
+        for path in PIPELINE_FILES:
+            sources.append(pd.read_excel(path))
+    elif "_source_file" in pipeline_all.columns:
+        sources = [
+            pipeline_all[pipeline_all["_source_file"] == source].copy()
+            for source in pipeline_all["_source_file"].dropna().unique()
+        ]
+    else:
+        sources = [pipeline_all.copy()]
+
+    for df in sources:
+        if "Business Unit" in df.columns:
+            df = df[df["Business Unit"] == division]
+        df = filter_pipeline_product(df, product_id, sf_codes=sf_codes)
+        if df.empty:
+            continue
+        if not pipeline_preprocessed:
+            if "snapshot_month" not in df.columns and "Month" in df.columns:
+                df["snapshot_month"] = parse_snapshot_month(df["Month"])
+            if "target_month" not in df.columns and "Close Date" in df.columns:
+                df["target_month"] = parse_close_date(df["Close Date"])
+            if "Probability" in df.columns:
+                df["Probability"] = pd.to_numeric(df["Probability"], errors="coerce")
+            if "Total Price" in df.columns:
+                df["Total Price"] = pd.to_numeric(df["Total Price"], errors="coerce")
+            if "Factored Quantity" in df.columns:
+                df["Factored Quantity"] = pd.to_numeric(df["Factored Quantity"], errors="coerce")
+            if "Factored Revenue" in df.columns:
+                df["Factored Revenue"] = pd.to_numeric(df["Factored Revenue"], errors="coerce")
+            if "Quantity" in df.columns:
+                df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce")
+            if "Quantity W/ Decimal" in df.columns:
+                df["Quantity W/ Decimal"] = pd.to_numeric(
+                    df["Quantity W/ Decimal"], errors="coerce"
+                )
+
+        if "target_month" in df.columns:
+            df = df.dropna(subset=["target_month"])
+        else:
+            continue
+
+        quantity_col = None
+        if "Quantity" in df.columns and df["Quantity"].notna().any():
+            quantity_col = "Quantity"
+        elif "Quantity W/ Decimal" in df.columns and df["Quantity W/ Decimal"].notna().any():
+            quantity_col = "Quantity W/ Decimal"
+        else:
+            quantity_col = "Quantity" if "Quantity" in df.columns else "Quantity W/ Decimal"
+
+        if "Probability" in df.columns:
+            prob = df["Probability"] / 100.0
+            df["stage_weighted_qty"] = df[quantity_col] * prob
+            if "Total Price" in df.columns:
+                df["stage_weighted_revenue"] = df["Total Price"] * prob
+            elif "Factored Revenue" in df.columns:
+                df["stage_weighted_revenue"] = df["Factored Revenue"]
+            else:
+                df["stage_weighted_revenue"] = np.nan
+        else:
+            df["stage_weighted_qty"] = np.nan
+            df["stage_weighted_revenue"] = np.nan
+
+        agg = (
+            df.groupby(["snapshot_month", "target_month"], dropna=False)
+            .agg(
+                pipeline_qty=(quantity_col, "sum"),
+                pipeline_factored_qty=("Factored Quantity", "sum"),
+                pipeline_factored_revenue=("Factored Revenue", "sum"),
+                pipeline_stage_weighted_qty=("stage_weighted_qty", "sum"),
+                pipeline_stage_weighted_revenue=("stage_weighted_revenue", "sum"),
+            )
+            .reset_index()
+        )
+        frames.append(agg)
+
+        if "Opportunity Name" in df.columns and "Account Name" in df.columns:
+            slip_df = df[
+                [
+                    "snapshot_month",
+                    "target_month",
+                    "Opportunity Name",
+                    "Account Name",
+                ]
+            ].copy()
+            slip_df["opp_key"] = (
+                slip_df["Account Name"].astype(str).str.strip()
+                + "||"
+                + slip_df["Opportunity Name"].astype(str).str.strip()
+            )
+            slip_frames.append(slip_df)
+
+    if not frames:
+        return pd.DataFrame()
+
+    pipeline_history = pd.concat(frames, ignore_index=True)
+
+    slippage_months_by_snapshot = {}
+    if slip_frames:
+        slip_all = pd.concat(slip_frames, ignore_index=True)
+        slip_all = slip_all.dropna(subset=["snapshot_month", "target_month", "opp_key"])
+        slip_all = slip_all.sort_values(["opp_key", "snapshot_month"])
+        slip_all["prior_target_month"] = slip_all.groupby("opp_key")["target_month"].shift(1)
+        prior = slip_all["prior_target_month"]
+        curr = slip_all["target_month"]
+        slip_months = (curr.dt.year - prior.dt.year) * 12 + (curr.dt.month - prior.dt.month)
+        slip_all["slip_months"] = slip_months.where(prior.notna(), np.nan)
+        slip_stats = slip_all.groupby("snapshot_month")["slip_months"].median()
+        slippage_months_by_snapshot = slip_stats.to_dict()
+
+    if slippage_months_by_snapshot:
+        pipeline_history["slippage_months"] = pipeline_history["snapshot_month"].map(
+            slippage_months_by_snapshot
+        )
+    else:
+        pipeline_history["slippage_months"] = np.nan
+
+    return pipeline_history
+
+
+def build_feature_frame(
+    actuals: pd.DataFrame,
+    pipeline: pd.DataFrame,
+    max_horizon: int,
+    feature_mode: str,
+    summary_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    actuals_series = actuals.set_index("Month")["Actuals"].sort_index()
+    actuals_lookup = actuals_series.to_dict()
+    all_actual_months = actuals_series.index
+    if all_actual_months.empty:
+        return pd.DataFrame()
+
+    snapshots = (
+        pipeline["snapshot_month"].dropna().sort_values().unique().tolist()
+        if not pipeline.empty
+        else []
+    )
+    if not snapshots:
+        return pd.DataFrame()
+
+    pipeline_keyed = pipeline.set_index(["snapshot_month", "target_month"])
+
+    summary_features: Dict[pd.Timestamp, Dict[str, float]] = {}
+    summary_cols = [
+        "Sum_Total_Price",
+        "Sum_Quantity",
+        "Open_Opportunities",
+        "New_Opportunities",
+        "Median_Months_Since_Last_Activity",
+        "Open_Not_Modified_90_Days",
+        "Early_Open_Opportunities",
+        "Late_Open_Opportunities",
+        "Open_Expected_Close_0_1_Months",
+        "Open_Expected_Close_2_3_Months",
+        "Open_Expected_Close_4_6_Months",
+        "Open_Expected_Close_7_12_Months",
+        "Open_Expected_Close_13_Plus_Months",
+        "Open_Top_Decile_Count",
+        "Open_Top_Decile_Close_0_3_Months",
+        "Pct_Open_Not_Modified_90_Days",
+        "Early_to_Late_Ratio",
+        "Closed_Won_Count_24m",
+        "Closed_Lost_Count_24m",
+        "Median_Days_To_Close_Won_24m",
+        "Mean_Days_To_Close_Won_24m",
+        "Won_Close_0_3_Count_24m",
+        "Won_Close_4_6_Count_24m",
+        "Won_Close_7_12_Count_24m",
+        "Won_Close_13_Plus_Count_24m",
+        "Closed_Win_Rate_24m",
+        "Pct_Won_Close_0_3_24m",
+        "Pct_Won_Close_4_6_24m",
+        "Pct_Won_Close_7_12_24m",
+        "Pct_Won_Close_13_Plus_24m",
+    ]
+    if summary_df is not None and not summary_df.empty:
+        for _, row in summary_df.iterrows():
+            key = pd.Timestamp(row["Month"])
+            summary_features[key] = {col: row.get(col, np.nan) for col in summary_cols}
+
+    snapshot_metrics = {}
+    snapshot_ts_list = [pd.Timestamp(s) for s in snapshots]
+    for snapshot_ts in snapshot_ts_list:
+        snap_rows = pipeline[pipeline["snapshot_month"] == snapshot_ts].copy()
+        snap_rows = snap_rows[snap_rows["target_month"] >= snapshot_ts]
+        if snap_rows.empty:
+            snapshot_metrics[snapshot_ts] = {}
+            continue
+
+        if feature_mode == "quantity":
+            snap_rows["pipeline_primary"] = snap_rows["pipeline_factored_qty"]
+            snap_rows["pipeline_stage_weighted_primary"] = snap_rows[
+                "pipeline_stage_weighted_qty"
+            ]
+        else:
+            snap_rows["pipeline_primary"] = snap_rows["pipeline_factored_revenue"]
+            snap_rows["pipeline_stage_weighted_primary"] = snap_rows[
+                "pipeline_stage_weighted_revenue"
+            ]
+
+        slip_months = snap_rows["slippage_months"].median()
+        slip_months = int(round(slip_months)) if pd.notna(slip_months) else 0
+        if slip_months:
+            snap_rows["slip_target_month"] = snap_rows["target_month"] + pd.DateOffset(
+                months=slip_months
+            )
+        else:
+            snap_rows["slip_target_month"] = snap_rows["target_month"]
+
+        slip_target_sum = (
+            snap_rows.groupby("slip_target_month")["pipeline_primary"].sum().to_dict()
+        )
+        metrics = {
+            "slippage_months": slip_months,
+            "pipeline_slip_adjusted_primary": slip_target_sum,
+        }
+        for win in [1, 2, 3]:
+            cutoff = snapshot_ts + pd.DateOffset(months=win)
+            due_mask = snap_rows["target_month"] <= cutoff
+            slip_mask = snap_rows["slip_target_month"] <= cutoff
+            metrics[f"pipeline_due_{win}m"] = float(
+                snap_rows.loc[due_mask, "pipeline_primary"].sum()
+            )
+            metrics[f"pipeline_stage_weighted_due_{win}m"] = float(
+                snap_rows.loc[due_mask, "pipeline_stage_weighted_primary"].sum()
+            )
+            metrics[f"pipeline_slip_adjusted_due_{win}m"] = float(
+                snap_rows.loc[slip_mask, "pipeline_primary"].sum()
+            )
+        snapshot_metrics[snapshot_ts] = metrics
+
+    rows = []
+    first_month = all_actual_months.min()
+    for snapshot_ts in snapshot_ts_list:
+        snapshot_for_lags = snapshot_ts - pd.DateOffset(months=1)
+        snap_metrics = snapshot_metrics.get(snapshot_ts, {})
+        slip_primary_map = snap_metrics.get("pipeline_slip_adjusted_primary", {})
+        summary_row = summary_features.get(snapshot_ts, {})
+
+        lag_months = [snapshot_for_lags - pd.DateOffset(months=i) for i in range(0, 12)]
+        lag_values = [
+            np.nan if actuals_lookup.get(m) is None else actuals_lookup.get(m)
+            for m in lag_months
+        ]
+        lag_1 = lag_values[0]
+        lag_2 = lag_values[1] if len(lag_values) > 1 else np.nan
+        lag_3 = lag_values[2] if len(lag_values) > 2 else np.nan
+
+        roll_mean_3 = safe_nanmean(lag_values[:3])
+        roll_mean_6 = safe_nanmean(lag_values[:6])
+        roll_mean_12 = safe_nanmean(lag_values[:12])
+        avg_actuals_12 = roll_mean_12
+
+        summary_primary = (
+            summary_row.get("Sum_Quantity")
+            if feature_mode == "quantity"
+            else summary_row.get("Sum_Total_Price")
+        )
+        if summary_primary is None:
+            summary_primary = np.nan
+        summary_primary_coverage = (
+            summary_primary / avg_actuals_12
+            if avg_actuals_12 and not np.isnan(avg_actuals_12)
+            else np.nan
+        )
+        summary_payload = {f"summary_{key}": summary_row.get(key, np.nan) for key in summary_cols}
+
+        trend_idx = month_diff(snapshot_for_lags, first_month)
+
+        try:
+            snap_slice = pipeline_keyed.xs(snapshot_ts, level=0)
+        except KeyError:
+            snap_slice = pd.DataFrame()
+        snap_qty = snap_slice["pipeline_qty"].to_dict() if not snap_slice.empty else {}
+        snap_factored_qty = (
+            snap_slice["pipeline_factored_qty"].to_dict() if not snap_slice.empty else {}
+        )
+        snap_factored_revenue = (
+            snap_slice["pipeline_factored_revenue"].to_dict() if not snap_slice.empty else {}
+        )
+        snap_stage_weighted_qty = (
+            snap_slice["pipeline_stage_weighted_qty"].to_dict() if not snap_slice.empty else {}
+        )
+        snap_stage_weighted_revenue = (
+            snap_slice["pipeline_stage_weighted_revenue"].to_dict() if not snap_slice.empty else {}
+        )
+
+        prior_snapshot = snapshot_ts - pd.DateOffset(months=1)
+        try:
+            prior_slice = pipeline_keyed.xs(prior_snapshot, level=0)
+        except KeyError:
+            prior_slice = pd.DataFrame()
+        prior_factored_qty = (
+            prior_slice["pipeline_factored_qty"].to_dict() if not prior_slice.empty else {}
+        )
+        prior_factored_revenue = (
+            prior_slice["pipeline_factored_revenue"].to_dict() if not prior_slice.empty else {}
+        )
+
+        for target_month in all_actual_months:
+            if target_month < snapshot_ts:
+                continue
+            months_ahead = month_diff(target_month, snapshot_ts)
+            if months_ahead > max_horizon:
+                continue
+
+            pipeline_qty = float(snap_qty.get(target_month, 0.0))
+            pipeline_factored_qty = float(snap_factored_qty.get(target_month, 0.0))
+            pipeline_factored_revenue = float(snap_factored_revenue.get(target_month, 0.0))
+            pipeline_stage_weighted_qty = float(snap_stage_weighted_qty.get(target_month, 0.0))
+            pipeline_stage_weighted_revenue = float(
+                snap_stage_weighted_revenue.get(target_month, 0.0)
+            )
+
+            pipeline_primary = (
+                pipeline_factored_qty if feature_mode == "quantity" else pipeline_factored_revenue
+            )
+            pipeline_stage_weighted_primary = (
+                pipeline_stage_weighted_qty
+                if feature_mode == "quantity"
+                else pipeline_stage_weighted_revenue
+            )
+            prior_primary = float(
+                prior_factored_qty.get(target_month, 0.0)
+                if feature_mode == "quantity"
+                else prior_factored_revenue.get(target_month, 0.0)
+            )
+            delta_pipeline = pipeline_primary - prior_primary
+            pct_delta_pipeline = (
+                delta_pipeline / prior_primary if prior_primary not in (0.0, np.nan) else np.nan
+            )
+            pipeline_coverage = (
+                pipeline_primary / avg_actuals_12
+                if avg_actuals_12 and not np.isnan(avg_actuals_12)
+                else np.nan
+            )
+            target_actual = actuals_series.get(target_month)
+            if pd.isna(target_actual):
+                continue
+
+            rows.append(
+                {
+                    "snapshot_month": snapshot_ts,
+                    "target_month": target_month,
+                    "months_ahead": months_ahead,
+                    "target_month_num": target_month.month,
+                    "lag_1": lag_1,
+                    "lag_2": lag_2,
+                    "lag_3": lag_3,
+                    "roll_mean_3": roll_mean_3,
+                    "roll_mean_6": roll_mean_6,
+                    "roll_mean_12": roll_mean_12,
+                    "trend_idx": trend_idx,
+                    "pipeline_qty": pipeline_qty,
+                    "pipeline_factored_qty": pipeline_factored_qty,
+                    "pipeline_factored_revenue": pipeline_factored_revenue,
+                    "pipeline_stage_weighted_qty": pipeline_stage_weighted_qty,
+                    "pipeline_stage_weighted_revenue": pipeline_stage_weighted_revenue,
+                    "pipeline_primary": pipeline_primary,
+                    "pipeline_stage_weighted_primary": pipeline_stage_weighted_primary,
+                    "prior_pipeline_primary": prior_primary,
+                    "delta_pipeline": delta_pipeline,
+                    "pct_delta_pipeline": pct_delta_pipeline,
+                    "pipeline_coverage": pipeline_coverage,
+                    "pipeline_slip_adjusted_primary": float(
+                        slip_primary_map.get(target_month, 0.0)
+                    ),
+                    "pipeline_due_1m": snap_metrics.get("pipeline_due_1m", np.nan),
+                    "pipeline_due_2m": snap_metrics.get("pipeline_due_2m", np.nan),
+                    "pipeline_due_3m": snap_metrics.get("pipeline_due_3m", np.nan),
+                    "pipeline_stage_weighted_due_1m": snap_metrics.get(
+                        "pipeline_stage_weighted_due_1m", np.nan
+                    ),
+                    "pipeline_stage_weighted_due_2m": snap_metrics.get(
+                        "pipeline_stage_weighted_due_2m", np.nan
+                    ),
+                    "pipeline_stage_weighted_due_3m": snap_metrics.get(
+                        "pipeline_stage_weighted_due_3m", np.nan
+                    ),
+                    "pipeline_slip_adjusted_due_1m": snap_metrics.get(
+                        "pipeline_slip_adjusted_due_1m", np.nan
+                    ),
+                    "pipeline_slip_adjusted_due_2m": snap_metrics.get(
+                        "pipeline_slip_adjusted_due_2m", np.nan
+                    ),
+                    "pipeline_slip_adjusted_due_3m": snap_metrics.get(
+                        "pipeline_slip_adjusted_due_3m", np.nan
+                    ),
+                    "slippage_months": snap_metrics.get("slippage_months", np.nan),
+                    "summary_primary": summary_primary,
+                    "summary_primary_coverage": summary_primary_coverage,
+                    **summary_payload,
+                    "actuals": target_actual,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def build_baseline_features(y: pd.Series) -> pd.DataFrame:
+    y = pd.Series(y).astype(float)
+    features = pd.DataFrame(index=y.index)
+    features["y_lag1"] = y.shift(1)
+    features["y_lag2"] = y.shift(2)
+    features["y_lag3"] = y.shift(3)
+    if len(y.dropna()) >= 24:
+        features["y_lag12"] = y.shift(12)
+    features["month_of_year"] = y.index.month
+    features["trend_index"] = np.arange(len(y))
+    return features
+
+
+def train_baseline_model(actuals_series: pd.Series):
+    features = build_baseline_features(actuals_series)
+    df_ml = pd.concat([features, actuals_series.rename("y")], axis=1).dropna()
+    if len(df_ml) <= 5:
+        raise RuntimeError("Insufficient rows for baseline ML training.")
+
+    model = GradientBoostingRegressor(random_state=42)
+    model.fit(df_ml.drop(columns=["y"]), df_ml["y"])
+    preds = pd.Series(model.predict(df_ml.drop(columns=["y"])), index=df_ml.index)
+    feature_columns = list(df_ml.drop(columns=["y"]).columns)
+    return model, feature_columns, preds
+
+
+def forecast_baseline_recursive(
+    model: GradientBoostingRegressor,
+    y_history: List[float],
+    last_date: pd.Timestamp,
+    horizon: int,
+    feature_columns: List[str],
+) -> pd.Series:
+    preds = []
+    history = list(y_history)
+    start_trend = len(history)
+    include_lag12 = "y_lag12" in feature_columns
+
+    for step in range(1, horizon + 1):
+        future_date = last_date + pd.DateOffset(months=step)
+        if len(history) < 3 or (include_lag12 and len(history) < 12):
+            raise RuntimeError("Insufficient history for baseline recursive forecast.")
+
+        row = {
+            "y_lag1": history[-1],
+            "y_lag2": history[-2],
+            "y_lag3": history[-3],
+            "month_of_year": future_date.month,
+            "trend_index": start_trend + (step - 1),
+        }
+        if include_lag12:
+            row["y_lag12"] = history[-12]
+
+        X_next = pd.DataFrame([row])[feature_columns]
+        y_next = float(model.predict(X_next)[0])
+        preds.append(y_next)
+        history.append(y_next)
+
+    index = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=horizon, freq="MS")
+    return pd.Series(preds, index=index)
+
+
+def baseline_forecast_for_snapshot(
+    actuals_series: pd.Series,
+    snapshot_month: pd.Timestamp,
+    horizon: int,
+) -> Optional[pd.Series]:
+    snapshot_ts = pd.Timestamp(snapshot_month)
+    cutoff = snapshot_ts - pd.DateOffset(months=1)
+    history = actuals_series[actuals_series.index <= cutoff].dropna()
+    if history.empty or horizon <= 0:
+        return None
+    try:
+        model, feature_cols, _ = train_baseline_model(history)
+    except RuntimeError:
+        return None
+    try:
+        forecast = forecast_baseline_recursive(
+            model=model,
+            y_history=list(history.values),
+            last_date=history.index.max(),
+            horizon=horizon,
+            feature_columns=feature_cols,
+        )
+    except RuntimeError:
+        return None
+    return forecast
+
+
+def train_models(df: pd.DataFrame) -> ModelBundle:
+    adjustment_features = [
+        "months_ahead",
+        "target_month_num",
+        "pipeline_primary",
+        "pipeline_stage_weighted_primary",
+        "delta_pipeline",
+        "pct_delta_pipeline",
+        "pipeline_coverage",
+        "pipeline_slip_adjusted_primary",
+        "pipeline_due_1m",
+        "pipeline_due_2m",
+        "pipeline_due_3m",
+        "pipeline_stage_weighted_due_1m",
+        "pipeline_stage_weighted_due_2m",
+        "pipeline_stage_weighted_due_3m",
+        "pipeline_slip_adjusted_due_1m",
+        "pipeline_slip_adjusted_due_2m",
+        "pipeline_slip_adjusted_due_3m",
+        "slippage_months",
+        "baseline_pred",
+    ]
+    summary_feature_prefix = "summary_"
+    summary_cols = [col for col in df.columns if col.startswith(summary_feature_prefix)]
+    candidate_summary = ["summary_primary", "summary_primary_coverage"] + summary_cols
+    summary_available = [col for col in candidate_summary if df[col].notna().any()]
+    adjustment_features.extend(summary_available)
+
+    df = df.copy()
+    df = df.dropna(subset=["actuals", "baseline_pred"])
+    df["residual"] = df["actuals"] - df["baseline_pred"]
+
+    adjustment_model = None
+    if df[adjustment_features].notna().any().any():
+        adjustment_model = Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                (
+                    "model",
+                    GradientBoostingRegressor(
+                        n_estimators=250,
+                        learning_rate=0.05,
+                        max_depth=3,
+                        random_state=42,
+                    ),
+                ),
+            ]
+        )
+        adjustment_model.fit(df[adjustment_features], df["residual"])
+
+    return ModelBundle(
+        adjustment_model=adjustment_model,
+        adjustment_features=adjustment_features,
+    )
+
+
+def predict_with_models(df: pd.DataFrame, bundle: ModelBundle) -> pd.DataFrame:
+    output = df.copy()
+
+    if bundle.adjustment_model is not None:
+        output["adjustment_pred"] = bundle.adjustment_model.predict(
+            output[bundle.adjustment_features]
+        )
+    else:
+        output["adjustment_pred"] = 0.0
+
+    output["final_pred"] = output["baseline_pred"] + output["adjustment_pred"]
+    output["final_pred"] = output["final_pred"].clip(lower=0.0)
+    return output
+
+
+def compute_rolling_cv_mae(training: pd.DataFrame, holdout_months: int) -> float:
+    if training.empty:
+        return np.nan
+    target_months = sorted(training["target_month"].dropna().unique())
+    if len(target_months) < holdout_months:
+        return np.nan
+    holdout_targets = target_months[-holdout_months:]
+    fold_mae = []
+    for cutoff in holdout_targets:
+        train_df = training[training["target_month"] < cutoff].copy()
+        test_df = training[training["target_month"] == cutoff].copy()
+        if train_df.empty or test_df.empty:
+            continue
+        bundle = train_models(train_df)
+        preds = predict_with_models(test_df, bundle)
+        abs_err = (preds["final_pred"] - preds["actuals"]).abs()
+        if not abs_err.empty:
+            fold_mae.append(float(abs_err.mean()))
+    return float(np.mean(fold_mae)) if fold_mae else np.nan
+
+
 def _compute_test_window(history_months: int) -> int:
     """Match forecast script: smaller test windows for short histories."""
-    if history_months < 24:
-        return min(TEST_HORIZON, max(6, int(np.floor(0.25 * history_months))))
     return TEST_HORIZON
 
 
@@ -550,6 +1336,9 @@ def rolling_origin_cv_ml(
 def evaluate_ml_candidate(
     df_sku: pd.DataFrame,
     horizon: int = TEST_HORIZON,
+    sku=None,
+    bu=None,
+    return_holdout: bool = False,
 ):
     """
     Fit ML challenger and return metrics + skip reasons (if any).
@@ -574,7 +1363,7 @@ def evaluate_ml_candidate(
 
     if len(df_ml) <= horizon + 5:
         metrics["Skip_Reason"] = "Insufficient ML rows after dropping NaNs."
-        return metrics
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
 
     train_end = len(df_ml) - horizon
     train = df_ml.iloc[:train_end]
@@ -588,7 +1377,7 @@ def evaluate_ml_candidate(
         feature_cols = [c for c in feature_cols if c not in exog_nonnull]
     if not feature_cols:
         metrics["Skip_Reason"] = "No usable ML features after exog handling."
-        return metrics
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
 
     try:
         model = GradientBoostingRegressor(random_state=42)
@@ -596,7 +1385,7 @@ def evaluate_ml_candidate(
         preds = model.predict(test[feature_cols])
     except Exception as exc:
         metrics["Skip_Reason"] = f"ML fit failed: {exc}"
-        return metrics
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
 
     metrics["Test_MAE"] = safe_mae(test["y"].values, preds)
     metrics["Test_RMSE"] = safe_rmse(test["y"].values, preds)
@@ -624,8 +1413,103 @@ def evaluate_ml_candidate(
 
     if metrics["Requires_Future_Exog"] and not metrics["Skip_Reason"]:
         metrics["Skip_Reason"] = "ML uses exogenous features; future exog not allowed for recommendation."
+    if not return_holdout:
+        return metrics
+    holdout_df = _build_holdout_df(
+        sku,
+        bu,
+        metrics["Model"],
+        test.index,
+        test["y"].values,
+        preds,
+    )
+    return metrics, holdout_df
 
-    return metrics
+
+def evaluate_ml_pipeline_candidate(
+    actuals_df: pd.DataFrame,
+    actuals_series: pd.Series,
+    pipeline_history: pd.DataFrame,
+    feature_mode: str,
+    summary_df: pd.DataFrame,
+    holdout_months: int = TEST_HORIZON,
+    sku=None,
+    bu=None,
+    return_holdout: bool = False,
+):
+    metrics = {
+        "Model": PIPELINE_ML_MODEL_NAME,
+        "Test_MAE": np.nan,
+        "Test_RMSE": np.nan,
+        "AIC": np.nan,
+        "BIC": np.nan,
+        "ROCV_MAE": np.nan,
+        "Regressor_coef": np.nan,
+        "Regressor_pvalue": np.nan,
+        "Skip_Reason": "",
+    }
+
+    if pipeline_history.empty:
+        metrics["Skip_Reason"] = "No pipeline history rows."
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
+    if summary_df.empty:
+        metrics["Skip_Reason"] = "No summary data for product/BU."
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
+
+    training = build_feature_frame(
+        actuals_df,
+        pipeline_history,
+        holdout_months,
+        feature_mode,
+        summary_df=summary_df,
+    )
+    if training.empty:
+        metrics["Skip_Reason"] = "No training rows after assembling pipeline features."
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
+
+    training["baseline_pred"] = np.nan
+    for snapshot in sorted(training["snapshot_month"].dropna().unique()):
+        snapshot_rows = training["snapshot_month"] == snapshot
+        # Include the max months_ahead target month (months_ahead starts at 0 for snapshot month).
+        horizon = int(training.loc[snapshot_rows, "months_ahead"].max()) + 1
+        forecast = baseline_forecast_for_snapshot(actuals_series, snapshot, horizon)
+        if forecast is None:
+            continue
+        training.loc[snapshot_rows, "baseline_pred"] = training.loc[
+            snapshot_rows, "target_month"
+        ].map(forecast)
+    training = training.dropna(subset=["baseline_pred"])
+    if training.empty:
+        metrics["Skip_Reason"] = "No baseline predictions available for pipeline training."
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
+
+    metrics["ROCV_MAE"] = compute_rolling_cv_mae(training, holdout_months)
+
+    holdout_start = actuals_series.index.max() - pd.DateOffset(months=holdout_months - 1)
+    holdout_df = training[training["target_month"] >= holdout_start].copy()
+    train_adj_df = training[training["target_month"] < holdout_start].copy()
+    if holdout_df.empty or train_adj_df.empty:
+        metrics["Skip_Reason"] = "Insufficient pipeline rows for 12-month holdout."
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
+
+    bundle = train_models(train_adj_df)
+    holdout_pred = predict_with_models(holdout_df, bundle)
+    abs_err = (holdout_pred["final_pred"] - holdout_pred["actuals"]).abs()
+    metrics["Test_MAE"] = float(abs_err.mean()) if not abs_err.empty else np.nan
+    metrics["Test_RMSE"] = float(
+        np.sqrt(mean_squared_error(holdout_pred["actuals"], holdout_pred["final_pred"]))
+    ) if not holdout_pred.empty else np.nan
+    if not return_holdout:
+        return metrics
+    holdout_rows = _build_holdout_df(
+        sku,
+        bu,
+        metrics["Model"],
+        holdout_pred["target_month"],
+        holdout_pred["actuals"],
+        holdout_pred["final_pred"],
+    )
+    return metrics, holdout_rows
 
 
 def fit_sarima_baseline(y_train, order, seasonal_order):
@@ -723,7 +1607,8 @@ def evaluate_single_model(
     bu=None,
     exog_clean_full=None,
     rocv_spec=None,
-    exog_invalid=False
+    exog_invalid=False,
+    return_holdout: bool = False,
 ):
     """
     Fit model, compute test MAE/RMSE on last 'horizon' points,
@@ -734,7 +1619,7 @@ def evaluate_single_model(
 
     # If too short, bail with NaNs
     if n_total <= horizon + 5:  # need at least some training
-        return {
+        metrics = {
             "Model": model_name,
             "Test_MAE": np.nan,
             "Test_RMSE": np.nan,
@@ -744,10 +1629,12 @@ def evaluate_single_model(
             "Regressor_coef": np.nan,
             "Regressor_pvalue": np.nan
         }
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
 
     if exog is not None:
         if exog_invalid:
-            return _regressor_failure_metrics(model_name)
+            metrics = _regressor_failure_metrics(model_name)
+            return (metrics, pd.DataFrame()) if return_holdout else metrics
 
         train_end = n_total - horizon
         y_train = y.iloc[:train_end]
@@ -765,13 +1652,15 @@ def evaluate_single_model(
 
         # If still all NaN after cleaning, bail with large MAE
         if exog_train.notna().sum() == 0:
-            return _regressor_failure_metrics(model_name)
+            metrics = _regressor_failure_metrics(model_name)
+            return (metrics, pd.DataFrame()) if return_holdout else metrics
 
         # Fit SARIMAX
         try:
             res = fit_sarimax(y_train, exog_train, order=order, seasonal_order=seasonal_order)
         except Exception:
-            return _regressor_failure_metrics(model_name)
+            metrics = _regressor_failure_metrics(model_name)
+            return (metrics, pd.DataFrame()) if return_holdout else metrics
 
         # Forecast
         try:
@@ -793,7 +1682,7 @@ def evaluate_single_model(
         except Exception:
             pass
 
-        return {
+        metrics = {
             "Model": model_name,
             "Test_MAE": safe_mae(y_test.values, y_pred.values) if not y_pred.isna().all() else 1e9,
             "Test_RMSE": safe_rmse(y_test.values, y_pred.values) if not y_pred.isna().all() else 1e9,
@@ -803,6 +1692,17 @@ def evaluate_single_model(
             "Regressor_coef": reg_coef,
             "Regressor_pvalue": reg_pval
         }
+        if not return_holdout:
+            return metrics
+        holdout_df = _build_holdout_df(
+            sku,
+            bu,
+            model_name,
+            y_test.index,
+            y_test.values,
+            pd.Series(y_pred, index=y_test.index).values,
+        )
+        return metrics, holdout_df
 
     else:
         train_end = n_total - horizon
@@ -813,7 +1713,7 @@ def evaluate_single_model(
         try:
             res = fit_sarima_baseline(y_train, order=order, seasonal_order=seasonal_order)
         except Exception:
-            return {
+            metrics = {
                 "Model": model_name,
                 "Test_MAE": np.nan,
                 "Test_RMSE": np.nan,
@@ -823,6 +1723,7 @@ def evaluate_single_model(
                 "Regressor_coef": np.nan,
                 "Regressor_pvalue": np.nan
             }
+            return (metrics, pd.DataFrame()) if return_holdout else metrics
 
         try:
             forecast_res = res.get_forecast(steps=horizon)
@@ -832,7 +1733,7 @@ def evaluate_single_model(
 
         rocv_mae = rolling_origin_cv_precomputed(rocv_spec, order=order, seasonal_order=seasonal_order)
 
-        return {
+        metrics = {
             "Model": model_name,
             "Test_MAE": safe_mae(y_test.values, y_pred.values),
             "Test_RMSE": safe_rmse(y_test.values, y_pred.values),
@@ -842,6 +1743,17 @@ def evaluate_single_model(
             "Regressor_coef": np.nan,
             "Regressor_pvalue": np.nan
         }
+        if not return_holdout:
+            return metrics
+        holdout_df = _build_holdout_df(
+            sku,
+            bu,
+            model_name,
+            y_test.index,
+            y_test.values,
+            pd.Series(y_pred, index=y_test.index).values,
+        )
+        return metrics, holdout_df
 
 
 def evaluate_ets_model(
@@ -851,6 +1763,7 @@ def evaluate_ets_model(
     sku=None,
     bu=None,
     rocv_spec=None,
+    return_holdout: bool = False,
 ):
     """
     Fit ETS (best by AICc/AIC), compute test MAE/RMSE on last 'horizon' points,
@@ -861,7 +1774,7 @@ def evaluate_ets_model(
     n_total = len(y_clean)
 
     if n_total <= horizon:
-        return {
+        metrics = {
             "Model": model_name,
             "Test_MAE": np.nan,
             "Test_RMSE": np.nan,
@@ -871,6 +1784,7 @@ def evaluate_ets_model(
             "Regressor_coef": np.nan,
             "Regressor_pvalue": np.nan
         }
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
 
     train_end = n_total - horizon
     y_train = y_clean.iloc[:train_end]
@@ -879,7 +1793,7 @@ def evaluate_ets_model(
     context = f" for {sku}/{bu}" if sku or bu else ""
     ets_res, ets_spec, ets_impl = _select_best_ets_model(y_train, context=context)
     if ets_res is None:
-        return {
+        metrics = {
             "Model": model_name,
             "Test_MAE": np.nan,
             "Test_RMSE": np.nan,
@@ -889,6 +1803,7 @@ def evaluate_ets_model(
             "Regressor_coef": np.nan,
             "Regressor_pvalue": np.nan
         }
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
 
     try:
         y_pred = _forecast_ets(ets_res, steps=horizon, index=y_test.index)
@@ -900,7 +1815,7 @@ def evaluate_ets_model(
     aic = getattr(ets_res, "aic", np.nan)
     bic = getattr(ets_res, "bic", np.nan)
 
-    return {
+    metrics = {
         "Model": model_name,
         "Test_MAE": safe_mae(y_test.values, y_pred.values),
         "Test_RMSE": safe_rmse(y_test.values, y_pred.values),
@@ -910,6 +1825,17 @@ def evaluate_ets_model(
         "Regressor_coef": np.nan,
         "Regressor_pvalue": np.nan
     }
+    if not return_holdout:
+        return metrics
+    holdout_df = _build_holdout_df(
+        sku,
+        bu,
+        model_name,
+        y_test.index,
+        y_test.values,
+        pd.Series(y_pred, index=y_test.index).values,
+    )
+    return metrics, holdout_df
 
 
 def _prepare_prophet_df(y_series: pd.Series) -> pd.DataFrame:
@@ -935,7 +1861,7 @@ def _coerce_month_start_series(y_series: pd.Series) -> pd.Series:
     return y_clean
 
 
-def _evaluate_prophet_metrics(y_series, horizon=TEST_HORIZON, sku=None, bu=None):
+def _evaluate_prophet_metrics(y_series, horizon=TEST_HORIZON, sku=None, bu=None, return_holdout: bool = False):
     metrics = {
         "Model": "PROPHET",
         "Test_MAE": np.nan,
@@ -951,16 +1877,16 @@ def _evaluate_prophet_metrics(y_series, horizon=TEST_HORIZON, sku=None, bu=None)
 
     if not PROPHET_AVAILABLE:
         metrics["Skip_Reason"] = "Prophet not installed."
-        return metrics
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
 
     y_clean = _coerce_month_start_series(y_series)
     if len(y_clean) < 24:
         metrics["Skip_Reason"] = "Insufficient history (<24 months)."
-        return metrics
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
 
     if len(y_clean) <= horizon + 5:
         metrics["Skip_Reason"] = "Insufficient history after holdout."
-        return metrics
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
 
     train_end = len(y_clean) - horizon
     y_train = y_clean.iloc[:train_end]
@@ -970,7 +1896,7 @@ def _evaluate_prophet_metrics(y_series, horizon=TEST_HORIZON, sku=None, bu=None)
         train_df = _prepare_prophet_df(y_train)
         if train_df.empty:
             metrics["Skip_Reason"] = "No usable Prophet training data."
-            return metrics
+            return (metrics, pd.DataFrame()) if return_holdout else metrics
 
         model = Prophet(
             yearly_seasonality=True,
@@ -994,7 +1920,7 @@ def _evaluate_prophet_metrics(y_series, horizon=TEST_HORIZON, sku=None, bu=None)
         sku_txt = f"{sku}/{bu}" if sku or bu else ""
         print(f"Prophet failed for SKU {sku_txt}: {exc}")
         metrics["Skip_Reason"] = f"Prophet failed: {exc}"
-        return metrics
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
 
     # ROCV
     try:
@@ -1032,7 +1958,17 @@ def _evaluate_prophet_metrics(y_series, horizon=TEST_HORIZON, sku=None, bu=None)
     except Exception:
         metrics["ROCV_MAE"] = np.nan
 
-    return metrics
+    if not return_holdout:
+        return metrics
+    holdout_df = _build_holdout_df(
+        sku,
+        bu,
+        metrics["Model"],
+        y_test.index,
+        y_test.values,
+        pd.Series(y_pred, index=y_test.index).values,
+    )
+    return metrics, holdout_df
 
 
 def _model_tiebreak_key(m):
@@ -1044,6 +1980,482 @@ def _model_tiebreak_key(m):
         rmse if np.isfinite(rmse) else np.inf,
         model_name,
     )
+
+
+def _model_tiebreak_key_df(row: pd.Series) -> tuple:
+    mae = row.get("Test_MAE", np.nan)
+    rmse = row.get("Test_RMSE", np.nan)
+    model_name = str(row.get("Model", ""))
+    return (
+        mae if np.isfinite(mae) else np.inf,
+        rmse if np.isfinite(rmse) else np.inf,
+        model_name,
+    )
+
+
+def compute_directional_accuracy(ts_df: pd.DataFrame, min_periods: int = DA_MIN_PERIODS) -> pd.DataFrame:
+    if ts_df.empty:
+        return pd.DataFrame(columns=[COL_PRODUCT, COL_DIVISION, "Model", "DA", "DA_Valid_Periods"])
+
+    df = ts_df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    df["Actual"] = pd.to_numeric(df["Actual"], errors="coerce")
+    df["Forecast"] = pd.to_numeric(df["Forecast"], errors="coerce")
+    df = df.dropna(subset=["Date", "Actual", "Forecast"])
+
+    def _group_da(group: pd.DataFrame) -> pd.Series:
+        group = group.sort_values("Date")
+        if len(group) < 2:
+            return pd.Series({"DA": np.nan, "DA_Valid_Periods": 0})
+        delta_actual = np.sign(np.diff(group["Actual"].values))
+        delta_forecast = np.sign(np.diff(group["Forecast"].values))
+        valid = np.isfinite(delta_actual) & np.isfinite(delta_forecast)
+        valid_count = int(valid.sum())
+        if valid_count < min_periods:
+            return pd.Series({"DA": np.nan, "DA_Valid_Periods": valid_count})
+        da = float(np.mean(delta_actual[valid] == delta_forecast[valid]))
+        return pd.Series({"DA": da, "DA_Valid_Periods": valid_count})
+
+    grouped = df.groupby([COL_PRODUCT, COL_DIVISION, "Model"], dropna=False)
+    da_df = grouped.apply(_group_da)
+    group_cols = [COL_PRODUCT, COL_DIVISION, "Model"]
+    cols_to_drop = [c for c in group_cols if c in da_df.columns]
+    if cols_to_drop:
+        da_df = da_df.drop(columns=cols_to_drop)
+    da_df = da_df.reset_index()
+    return da_df
+
+
+def compute_bias_metrics(ts_df: pd.DataFrame, eps: float = 1e-9) -> pd.DataFrame:
+    if ts_df.empty:
+        return pd.DataFrame(
+            columns=[COL_PRODUCT, COL_DIVISION, "Model", "bias", "abs_bias", "bias_pct", "abs_bias_pct"]
+        )
+
+    df = ts_df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    df["Actual"] = pd.to_numeric(df["Actual"], errors="coerce")
+    df["Forecast"] = pd.to_numeric(df["Forecast"], errors="coerce")
+    df = df.dropna(subset=["Date", "Actual", "Forecast"])
+    if df.empty:
+        return pd.DataFrame(
+            columns=[COL_PRODUCT, COL_DIVISION, "Model", "bias", "abs_bias", "bias_pct", "abs_bias_pct"]
+        )
+
+    # Aggregate to unique target months so models with multiple snapshot rows
+    # (e.g., pipeline ML) don't inflate bias from duplicated months.
+    monthly = (
+        df.groupby([COL_PRODUCT, COL_DIVISION, "Model", "Date"], dropna=False)
+        .agg({"Actual": "mean", "Forecast": "mean"})
+        .reset_index()
+    )
+
+    def _group_bias(group: pd.DataFrame) -> pd.Series:
+        actual = group["Actual"].astype(float)
+        forecast = group["Forecast"].astype(float)
+        diff = forecast - actual
+        bias = float(diff.sum())
+        abs_bias = float(abs(bias))
+        denom = float(actual.sum())
+        denom = denom if abs(denom) > eps else eps
+        bias_pct = bias / denom
+        abs_bias_pct = abs(bias_pct)
+        return pd.Series(
+            {
+                "bias": bias,
+                "abs_bias": abs_bias,
+                "bias_pct": bias_pct,
+                "abs_bias_pct": abs_bias_pct,
+            }
+        )
+
+    grouped = monthly.groupby([COL_PRODUCT, COL_DIVISION, "Model"], dropna=False)
+    bias_df = grouped.apply(_group_bias)
+    group_cols = [COL_PRODUCT, COL_DIVISION, "Model"]
+    cols_to_drop = [c for c in group_cols if c in bias_df.columns]
+    if cols_to_drop:
+        bias_df = bias_df.drop(columns=cols_to_drop)
+    bias_df = bias_df.reset_index()
+    return bias_df
+
+
+def compute_weighted_holdout_metrics(ts_df: pd.DataFrame, eps: float = 1e-9) -> pd.DataFrame:
+    """
+    Compute weighted MAE/RMSE and bias on the holdout, emphasizing recent months.
+    Weights: most recent 3 months = 55%, months 4-6 = 30%, months 7-12 = 15%.
+    """
+    if ts_df.empty:
+        return pd.DataFrame(
+            columns=[
+                COL_PRODUCT, COL_DIVISION, "Model",
+                "Weighted_MAE", "Weighted_RMSE",
+                "bias", "abs_bias", "bias_pct", "abs_bias_pct",
+            ]
+        )
+
+    df = ts_df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    df["Actual"] = pd.to_numeric(df["Actual"], errors="coerce")
+    df["Forecast"] = pd.to_numeric(df["Forecast"], errors="coerce")
+    df = df.dropna(subset=["Date", "Actual", "Forecast"])
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                COL_PRODUCT, COL_DIVISION, "Model",
+                "Weighted_MAE", "Weighted_RMSE",
+                "bias", "abs_bias", "bias_pct", "abs_bias_pct",
+            ]
+        )
+
+    # Aggregate to unique target months so models with multiple snapshot rows
+    # (e.g., pipeline ML) don't inflate metrics from duplicated months.
+    monthly = (
+        df.groupby([COL_PRODUCT, COL_DIVISION, "Model", "Date"], dropna=False)
+        .agg({"Actual": "mean", "Forecast": "mean"})
+        .reset_index()
+    )
+
+    def _assign_recency_weights(dates: pd.Series) -> pd.Series:
+        max_date = dates.max()
+        months_back = dates.apply(lambda d: month_diff(max_date, d))
+        buckets = pd.Series(index=dates.index, dtype="object")
+        buckets[months_back <= 2] = "recent"
+        buckets[(months_back >= 3) & (months_back <= 5)] = "mid"
+        buckets[months_back >= 6] = "old"
+
+        base_weights = {"recent": 0.55, "mid": 0.30, "old": 0.15}
+        counts = buckets.value_counts()
+        present = {k: v for k, v in base_weights.items() if counts.get(k, 0) > 0}
+        total = sum(present.values())
+        if total <= 0:
+            return pd.Series(np.nan, index=dates.index)
+
+        normalized = {k: v / total for k, v in present.items()}
+        weights = pd.Series(index=dates.index, dtype="float64")
+        for bucket, weight in normalized.items():
+            count = counts.get(bucket, 0)
+            if count:
+                weights[buckets == bucket] = weight / float(count)
+        return weights
+
+    def _group_metrics(group: pd.DataFrame) -> pd.Series:
+        weights = _assign_recency_weights(group["Date"])
+        actual = group["Actual"].astype(float)
+        forecast = group["Forecast"].astype(float)
+        err = forecast - actual
+        abs_err = err.abs()
+        weights = weights.fillna(0.0)
+
+        w_mae = float((weights * abs_err).sum())
+        w_rmse = float(np.sqrt((weights * (err ** 2)).sum()))
+        bias = float((weights * err).sum())
+        abs_bias = float(abs(bias))
+        denom = float((weights * actual).sum())
+        denom = denom if abs(denom) > eps else eps
+        bias_pct = bias / denom
+        abs_bias_pct = abs(bias_pct)
+
+        return pd.Series(
+            {
+                "Weighted_MAE": w_mae,
+                "Weighted_RMSE": w_rmse,
+                "bias": bias,
+                "abs_bias": abs_bias,
+                "bias_pct": bias_pct,
+                "abs_bias_pct": abs_bias_pct,
+            }
+        )
+
+    grouped = monthly.groupby([COL_PRODUCT, COL_DIVISION, "Model"], dropna=False)
+    metrics_df = grouped.apply(_group_metrics)
+    group_cols = [COL_PRODUCT, COL_DIVISION, "Model"]
+    cols_to_drop = [c for c in group_cols if c in metrics_df.columns]
+    if cols_to_drop:
+        metrics_df = metrics_df.drop(columns=cols_to_drop)
+    metrics_df = metrics_df.reset_index()
+    return metrics_df
+
+
+def select_recommended_model(
+    metrics_df: pd.DataFrame,
+    ts_df: pd.DataFrame,
+    mae_tolerance: float = MAE_TOLERANCE,
+    rmse_tolerance: float = RMSE_TOLERANCE,
+    rocv_hard_multiplier: float = ROCV_HARD_MULTIPLIER,
+    da_min_periods: int = DA_MIN_PERIODS,
+    da_improvement_pp: float = DA_IMPROVEMENT_PP,
+    da_close_mae_tol: float = DA_CLOSE_MAE_TOL,
+    bias_use_pct: bool = True,
+    bias_improvement_ratio: Optional[float] = 0.70,
+    bias_improvement_abs_pp: Optional[float] = None,
+    mae_close_tol: float = 0.10,
+    rmse_close_tol: Optional[float] = None,
+    return_rankings: bool = False,
+) -> Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame]]:
+    if metrics_df.empty:
+        summary = pd.DataFrame(columns=[
+            COL_PRODUCT, COL_DIVISION, "Recommended_Model", "Baseline_Model", "Reason",
+            "baseline_mae", "baseline_rmse", "baseline_rocv", "baseline_DA",
+            "baseline_abs_bias", "baseline_abs_bias_pct",
+            "mae_cutoff", "rmse_cutoff", "rocv_hard_max",
+            "recommended_mae", "recommended_rmse", "recommended_rocv", "recommended_DA",
+            "recommended_bias", "recommended_abs_bias", "recommended_bias_pct", "recommended_abs_bias_pct",
+        ])
+        return (summary, pd.DataFrame()) if return_rankings else summary
+
+    metrics = metrics_df.copy()
+    metrics["Test_MAE"] = pd.to_numeric(metrics["Test_MAE"], errors="coerce")
+    metrics["Test_RMSE"] = pd.to_numeric(metrics["Test_RMSE"], errors="coerce")
+    if "ROCV_MAE" in metrics.columns:
+        metrics["ROCV_MAE"] = pd.to_numeric(metrics["ROCV_MAE"], errors="coerce")
+    else:
+        metrics["ROCV_MAE"] = np.nan
+    metrics["Model"] = metrics["Model"].astype(str)
+
+    da_df = compute_directional_accuracy(ts_df, min_periods=da_min_periods)
+    weighted_df = compute_weighted_holdout_metrics(ts_df)
+    metrics = metrics.merge(
+        da_df, on=[COL_PRODUCT, COL_DIVISION, "Model"], how="left"
+    ).merge(
+        weighted_df, on=[COL_PRODUCT, COL_DIVISION, "Model"], how="left"
+    )
+    metrics["Raw_Test_MAE"] = metrics["Test_MAE"]
+    metrics["Raw_Test_RMSE"] = metrics["Test_RMSE"]
+    metrics["Test_MAE"] = metrics["Weighted_MAE"]
+    metrics["Test_RMSE"] = metrics["Weighted_RMSE"]
+    metrics["Test_MAE"] = pd.to_numeric(metrics["Test_MAE"], errors="coerce")
+    metrics["Test_RMSE"] = pd.to_numeric(metrics["Test_RMSE"], errors="coerce")
+
+    summary_rows = []
+    ranking_rows = []
+
+    for (prod, div), group in metrics.groupby([COL_PRODUCT, COL_DIVISION], dropna=False):
+        group = group.copy()
+        valid = group[np.isfinite(group["Test_MAE"])]
+        if valid.empty:
+            summary_rows.append({
+                COL_PRODUCT: prod,
+                COL_DIVISION: div,
+                "Recommended_Model": None,
+                "Baseline_Model": None,
+                "Reason": "No valid model metrics available.",
+                "baseline_mae": np.nan,
+                "baseline_rmse": np.nan,
+                "baseline_rocv": np.nan,
+                "baseline_DA": np.nan,
+                "mae_cutoff": np.nan,
+                "rmse_cutoff": np.nan,
+                "rocv_hard_max": np.nan,
+                "recommended_mae": np.nan,
+                "recommended_rmse": np.nan,
+                "recommended_rocv": np.nan,
+                "recommended_DA": np.nan,
+            })
+            continue
+
+        baseline_idx = min(valid.index, key=lambda idx: _model_tiebreak_key_df(valid.loc[idx]))
+        baseline = valid.loc[baseline_idx]
+        baseline_model = baseline["Model"]
+        baseline_mae = baseline["Test_MAE"]
+        baseline_rmse = baseline["Test_RMSE"]
+        baseline_rocv = baseline["ROCV_MAE"]
+        baseline_da = baseline.get("DA", np.nan)
+        baseline_abs_bias = baseline.get("abs_bias", np.nan)
+        baseline_abs_bias_pct = baseline.get("abs_bias_pct", np.nan)
+
+        mae_cutoff = baseline_mae * (1.0 + mae_tolerance)
+        rmse_cutoff = baseline_rmse * (1.0 + rmse_tolerance)
+
+        rocv_checks_enabled = np.isfinite(baseline_rocv) and baseline_rocv > 0
+        rocv_hard_max = baseline_rocv * rocv_hard_multiplier if rocv_checks_enabled else np.nan
+
+        def _passes_accuracy(row: pd.Series) -> bool:
+            if row["Model"] == baseline_model:
+                return True
+            return bool(np.isfinite(row["Test_MAE"]) and np.isfinite(row["Test_RMSE"])
+                        and row["Test_MAE"] <= mae_cutoff and row["Test_RMSE"] <= rmse_cutoff)
+
+        def _passes_rocv(row: pd.Series) -> bool:
+            if row["Model"] == baseline_model:
+                return True
+            if not rocv_checks_enabled:
+                return True
+            rocv = row.get("ROCV_MAE", np.nan)
+            return bool(np.isfinite(rocv) and rocv <= rocv_hard_max)
+
+        group["passes_accuracy"] = group.apply(_passes_accuracy, axis=1)
+        group["passes_rocv_sanity"] = group.apply(_passes_rocv, axis=1)
+        group["candidate"] = group["passes_accuracy"] & group["passes_rocv_sanity"]
+
+        candidates = group[group["candidate"]]
+        if candidates.empty:
+            recommended = baseline
+            reason = "Fallback to baseline: no model passed accuracy+ROCV sanity."
+        else:
+            tentative_idx = min(candidates.index, key=lambda idx: _model_tiebreak_key_df(candidates.loc[idx]))
+            recommended = candidates.loc[tentative_idx]
+            reason = "Selected best MAE among accuracy-qualified models passing ROCV sanity."
+
+            challengers = candidates[candidates["Model"] != baseline_model].copy()
+            if not challengers.empty and np.isfinite(baseline_da):
+                challengers["da_valid"] = np.isfinite(challengers["DA"])
+                challengers = challengers[challengers["da_valid"]]
+                challengers = challengers[
+                    challengers["DA"] >= baseline_da + da_improvement_pp
+                ]
+                challengers = challengers[
+                    challengers["Test_MAE"] <= baseline_mae * (1.0 + da_close_mae_tol)
+                ]
+                if not challengers.empty:
+                    best_idx = challengers.sort_values(
+                        by=["DA", "Test_MAE", "Test_RMSE", "Model"],
+                        ascending=[False, True, True, True],
+                    ).index[0]
+                    recommended = challengers.loc[best_idx]
+                    delta_pp = (recommended["DA"] - baseline_da) * 100.0
+                    reason = (
+                        "Override: challenger improved directional accuracy by "
+                        f"{delta_pp:.1f}pp (DA_challenger vs DA_baseline) "
+                        "while within MAE+5% and passing accuracy+ROCV sanity."
+                    )
+                elif recommended["Model"] == baseline_model:
+                    reason = "Baseline wins: best MAE; no challenger improved DA by >=10pp within MAE+5%."
+            elif recommended["Model"] == baseline_model:
+                reason = "Baseline wins: best MAE; no challenger improved DA by >=10pp within MAE+5%."
+
+        used_bias_override = False
+        bias_metric = "abs_bias_pct" if bias_use_pct else "abs_bias"
+        bias_value = "bias_pct" if bias_use_pct else "bias"
+        baseline_bias_metric = baseline.get(bias_metric, np.nan)
+
+        group["qualifies_mae_close"] = False
+        group["qualifies_bias"] = False
+        group["qualifies_rmse_close"] = False
+
+        if candidates.empty or bias_improvement_ratio is None:
+            bias_challengers = pd.DataFrame()
+        else:
+            challengers = candidates[candidates["Model"] != baseline_model].copy()
+            if challengers.empty:
+                bias_challengers = pd.DataFrame()
+            else:
+                challengers["qualifies_mae_close"] = challengers["Test_MAE"] <= baseline_mae * (1.0 + mae_close_tol)
+                if rmse_close_tol is not None and np.isfinite(baseline_rmse):
+                    challengers["qualifies_rmse_close"] = (
+                        challengers["Test_RMSE"] <= baseline_rmse * (1.0 + rmse_close_tol)
+                    )
+                else:
+                    challengers["qualifies_rmse_close"] = True
+
+                if not np.isfinite(baseline_bias_metric) or baseline_bias_metric <= 0:
+                    challengers["qualifies_bias"] = False
+                else:
+                    challengers["qualifies_bias"] = challengers[bias_metric] <= (
+                        baseline_bias_metric * bias_improvement_ratio
+                    )
+                    if bias_improvement_abs_pp is not None:
+                        challengers["qualifies_bias"] &= (
+                            (baseline_bias_metric - challengers[bias_metric]) >= bias_improvement_abs_pp
+                        )
+
+                bias_challengers = challengers[
+                    challengers["qualifies_mae_close"]
+                    & challengers["qualifies_bias"]
+                    & challengers["qualifies_rmse_close"]
+                ]
+
+                group.loc[challengers.index, "qualifies_mae_close"] = challengers["qualifies_mae_close"]
+                group.loc[challengers.index, "qualifies_bias"] = challengers["qualifies_bias"]
+                group.loc[challengers.index, "qualifies_rmse_close"] = challengers["qualifies_rmse_close"]
+
+        if not bias_challengers.empty:
+            bias_idx = bias_challengers.sort_values(
+                by=[bias_metric, "Test_MAE", "Test_RMSE", "Model"],
+                ascending=[True, True, True, True],
+            ).index[0]
+            bias_selected = bias_challengers.loc[bias_idx]
+            recommended = bias_selected
+            used_bias_override = True
+            reduction = 1.0 - (bias_selected[bias_metric] / baseline_bias_metric)
+            reason = (
+                "Bias override: |bias| improved by "
+                f"{reduction * 100:.1f}% vs baseline while MAE within +10% "
+                "and passing accuracy+ROCV sanity."
+            )
+            if bias_improvement_abs_pp is not None and bias_use_pct:
+                reason = (
+                    reason.rstrip(".")
+                    + f" (>= {bias_improvement_abs_pp:.2%} abs bias pct improvement)."
+                )
+        else:
+            if candidates.empty or bias_improvement_ratio is None:
+                pass
+            else:
+                had_challengers = candidates[candidates["Model"] != baseline_model]
+                if had_challengers.empty:
+                    pass
+                else:
+                    any_mae_close = bool(had_challengers["Test_MAE"].le(baseline_mae * (1.0 + mae_close_tol)).any())
+                    any_bias_ok = (
+                        bool(
+                            had_challengers[bias_metric]
+                            .le(baseline_bias_metric * bias_improvement_ratio)
+                            .any()
+                        )
+                        if np.isfinite(baseline_bias_metric) and baseline_bias_metric > 0
+                        else False
+                    )
+                    if not any_mae_close:
+                        reason = reason + " Bias override not applied: no challenger within MAE +10%."
+                    elif not any_bias_ok:
+                        reason = reason + " Bias override not applied: no challenger met bias-improvement threshold."
+
+        group["baseline_model"] = baseline_model
+        group["baseline_mae"] = baseline_mae
+        group["baseline_rmse"] = baseline_rmse
+        group["baseline_rocv"] = baseline_rocv
+        group["baseline_DA"] = baseline_da
+        group["baseline_abs_bias"] = baseline_abs_bias
+        group["baseline_abs_bias_pct"] = baseline_abs_bias_pct
+        group["mae_cutoff"] = mae_cutoff
+        group["rmse_cutoff"] = rmse_cutoff
+        group["rocv_hard_max"] = rocv_hard_max
+        group["recommended_model"] = recommended["Model"]
+        group["recommended_by_override"] = recommended["Model"] != baseline_model and reason.startswith("Override:")
+        group["used_bias_override"] = used_bias_override
+
+        ranking_rows.append(group)
+
+        summary_rows.append({
+            COL_PRODUCT: prod,
+            COL_DIVISION: div,
+            "Recommended_Model": recommended["Model"],
+            "Baseline_Model": baseline_model,
+            "Reason": reason,
+            "baseline_mae": baseline_mae,
+            "baseline_rmse": baseline_rmse,
+            "baseline_rocv": baseline_rocv,
+            "baseline_DA": baseline_da,
+            "baseline_abs_bias": baseline_abs_bias,
+            "baseline_abs_bias_pct": baseline_abs_bias_pct,
+            "mae_cutoff": mae_cutoff,
+            "rmse_cutoff": rmse_cutoff,
+            "rocv_hard_max": rocv_hard_max,
+            "recommended_mae": recommended["Test_MAE"],
+            "recommended_rmse": recommended["Test_RMSE"],
+            "recommended_rocv": recommended.get("ROCV_MAE", np.nan),
+            "recommended_DA": recommended.get("DA", np.nan),
+            "recommended_bias": recommended.get("bias", np.nan),
+            "recommended_abs_bias": recommended.get("abs_bias", np.nan),
+            "recommended_bias_pct": recommended.get("bias_pct", np.nan),
+            "recommended_abs_bias_pct": recommended.get("abs_bias_pct", np.nan),
+            "used_bias_override": used_bias_override,
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+    ranking_df = pd.concat(ranking_rows, ignore_index=True) if ranking_rows else pd.DataFrame()
+
+    return (summary_df, ranking_df) if return_rankings else summary_df
 
 
 def choose_recommended_model(
@@ -1177,6 +2589,8 @@ def choose_recommended_model(
 def _model_type(model_name: str) -> str:
     if model_name == "ML_GBR":
         return "ML"
+    if model_name == PIPELINE_ML_MODEL_NAME:
+        return "ML"
     if model_name == "PROPHET":
         return "PROPHET"
     if model_name == "ETS_baseline":
@@ -1247,6 +2661,43 @@ def engineer_regressors(df_sku):
         df["Early_to_Late_Ratio_l2"] = df[COL_EARLY_TO_LATE_RATIO].shift(2)
 
     return df
+
+
+def merge_summary_regressors(df_all: pd.DataFrame, summary_full: pd.DataFrame) -> pd.DataFrame:
+    if summary_full.empty:
+        return df_all
+
+    summary = summary_full.copy()
+    summary["Product_norm"] = summary["group_key"].apply(normalize_code)
+    summary["Division_str"] = summary["BU"].astype(str)
+    summary = summary.rename(columns={"Month": COL_DATE})
+
+    summary_cols = [
+        col
+        for col in summary.columns
+        if col not in {"group_key", "BU", "Product_norm", "Division_str", COL_DATE}
+    ]
+    merge_cols = ["Product_norm", "Division_str", COL_DATE] + summary_cols
+    summary = summary[merge_cols]
+
+    df_all = df_all.copy()
+    df_all["Product_norm"] = df_all[COL_PRODUCT].apply(normalize_code)
+    df_all["Division_str"] = df_all[COL_DIVISION].astype(str)
+    df_all = df_all.merge(
+        summary,
+        on=["Product_norm", "Division_str", COL_DATE],
+        how="left",
+        suffixes=("", "_summary"),
+    )
+
+    for col in summary_cols:
+        summary_col = f"{col}_summary"
+        if summary_col in df_all.columns:
+            df_all[col] = df_all[summary_col]
+            df_all = df_all.drop(columns=[summary_col])
+
+    df_all = df_all.drop(columns=["Product_norm", "Division_str"], errors="ignore")
+    return df_all
 
 
 # ===========================
@@ -1371,8 +2822,76 @@ def main():
         output_excel_path=REVISED_ACTUALS_FILE,
         output_sheet=REVISED_ACTUALS_SHEET,
     )
+    summary_full = pd.DataFrame()
+    if SUMMARY_PATH.exists():
+        summary_full = load_summary_report(SUMMARY_PATH)
+    else:
+        print(f"[WARN] Summary file not found: {SUMMARY_PATH}")
+    df_all = merge_summary_regressors(df_all, summary_full)
     print(f"Loading per-SKU SARIMA orders from {ORDER_FILE}...")
     orders_map = load_orders_map(ORDER_FILE, overrides_path=NOTES_FILE)
+
+    catalog = pd.read_excel(PRODUCT_CATALOG_PATH)
+    if "group_key" in catalog.columns:
+        catalog["group_key_norm"] = catalog["group_key"].apply(normalize_code)
+    if "business_unit_code" in catalog.columns:
+        catalog["business_unit_code_str"] = catalog["business_unit_code"].astype(str)
+
+    pipeline_all = pd.DataFrame()
+    if PIPELINE_FILES:
+        pipeline_frames = []
+        for path in PIPELINE_FILES:
+            df = pd.read_excel(path)
+            df["_source_file"] = path.name
+            pipeline_frames.append(df)
+        pipeline_all = pd.concat(pipeline_frames, ignore_index=True)
+    if not pipeline_all.empty:
+        if "Month" in pipeline_all.columns and "snapshot_month" not in pipeline_all.columns:
+            pipeline_all["snapshot_month"] = parse_snapshot_month(pipeline_all["Month"])
+        if "Close Date" in pipeline_all.columns and "target_month" not in pipeline_all.columns:
+            pipeline_all["target_month"] = parse_close_date(pipeline_all["Close Date"])
+        numeric_cols = [
+            "Quantity",
+            "Quantity W/ Decimal",
+            "Probability",
+            "Total Price",
+            "Factored Quantity",
+            "Factored Revenue",
+        ]
+        for col in numeric_cols:
+            if col in pipeline_all.columns:
+                pipeline_all[col] = pd.to_numeric(pipeline_all[col], errors="coerce")
+        if "Product Code" in pipeline_all.columns:
+            pipeline_all["Product_Code_num"] = pd.to_numeric(
+                pipeline_all["Product Code"], errors="coerce"
+            )
+            pipeline_all["Product_Code_norm"] = pipeline_all["Product Code"].apply(
+                normalize_code
+            )
+        if "Current OSC Product Name" in pipeline_all.columns:
+            pipeline_all["Current_OSC_Product_Name_norm"] = pipeline_all[
+                "Current OSC Product Name"
+            ].apply(normalize_code)
+    pipeline_preprocessed = (
+        not pipeline_all.empty
+        and "snapshot_month" in pipeline_all.columns
+        and "target_month" in pipeline_all.columns
+    )
+
+    sf_reference = load_sf_product_reference()
+    sf_code_map: Dict[Tuple[str, str], List[str]] = {}
+    if not sf_reference.empty:
+        sf_reference = sf_reference.copy()
+        sf_reference["salesforce_product_name"] = sf_reference[
+            "salesforce_product_name"
+        ].astype(str)
+        grouped = sf_reference.groupby(["group_key", "business_unit_code"])
+        sf_code_map = {
+            (normalize_code(group_key), str(div)): list(
+                group["salesforce_product_name"].unique()
+            )
+            for (group_key, div), group in grouped
+        }
 
     # Basic cleaning
     df_all[COL_DATE] = pd.to_datetime(df_all[COL_DATE])
@@ -1381,7 +2900,9 @@ def main():
     results_rows = []
     recommended_rows = []
     ranking_rows_all = []
+    holdout_rows_all = []
     skipped_no_order = []
+    skipped_products = []
 
     # Loop over SKUs (by Product + Division)
     sku_groups = df_all.groupby([COL_PRODUCT, COL_DIVISION], dropna=False)
@@ -1394,6 +2915,14 @@ def main():
         if order_pair is None:
             print("  -> Skipping: no order/seasonal_order found in sarimax_order_search_summary.")
             skipped_no_order.append({"Product": prod, "Division": div, "Reason": "No order in order search summary"})
+            skipped_products.append(
+                {
+                    "Product": prod,
+                    "Division": div,
+                    "Model": "ALL",
+                    "Reason": "No order in order search summary.",
+                }
+            )
             results_rows.append({
                 "Product": prod,
                 "Division": div,
@@ -1422,16 +2951,44 @@ def main():
                 "baseline_model": None,
                 "baseline_mae": np.nan,
                 "baseline_rocv": np.nan,
+                "baseline_abs_bias": np.nan,
+                "baseline_abs_bias_pct": np.nan,
                 "mae_cutoff": np.nan,
                 "rmse_cutoff": np.nan,
                 "rocv_hard_max": np.nan,
                 "rocv_preferred_min": np.nan,
                 "rocv_preferred_max": np.nan,
+                "recommended_bias": np.nan,
+                "recommended_abs_bias": np.nan,
+                "recommended_bias_pct": np.nan,
+                "recommended_abs_bias_pct": np.nan,
+                "used_bias_override": False,
             })
             continue
 
         order, seasonal_order = order_pair
         df_sku = df_sku.sort_values(COL_DATE).set_index(COL_DATE)
+
+        summary_product = filter_summary_product(summary_full, prod, div)
+        feature_mode = None
+        pipeline_history = pd.DataFrame()
+        pipeline_skip_reason = ""
+        if enable_ml:
+            try:
+                feature_mode = load_feature_mode(prod, str(div), catalog=catalog)
+            except RuntimeError as exc:
+                pipeline_skip_reason = str(exc)
+            sf_codes = sf_code_map.get((normalize_code(prod), str(div)), [])
+            if not pipeline_all.empty:
+                pipeline_history = load_pipeline_history(
+                    prod,
+                    str(div),
+                    sf_codes=sf_codes,
+                    pipeline_all=pipeline_all,
+                    pipeline_preprocessed=pipeline_preprocessed,
+                )
+            else:
+                pipeline_skip_reason = pipeline_skip_reason or "No pipeline files available."
 
         # Engineer regressors
         df_sku = engineer_regressors(df_sku)
@@ -1456,6 +3013,14 @@ def main():
 
         if n < MIN_OBS_TOTAL:
             print(f"  -> Skipping (only {n} observations; need at least {MIN_OBS_TOTAL}).")
+            skipped_products.append(
+                {
+                    "Product": prod,
+                    "Division": div,
+                    "Model": "ALL",
+                    "Reason": f"Insufficient history (<{MIN_OBS_TOTAL} observations).",
+                }
+            )
             results_rows.append({
                 "Product": prod,
                 "Division": div,
@@ -1484,21 +3049,29 @@ def main():
                 "baseline_model": None,
                 "baseline_mae": np.nan,
                 "baseline_rocv": np.nan,
+                "baseline_abs_bias": np.nan,
+                "baseline_abs_bias_pct": np.nan,
                 "mae_cutoff": np.nan,
                 "rmse_cutoff": np.nan,
                 "rocv_hard_max": np.nan,
                 "rocv_preferred_min": np.nan,
                 "rocv_preferred_max": np.nan,
+                "recommended_bias": np.nan,
+                "recommended_abs_bias": np.nan,
+                "recommended_bias_pct": np.nan,
+                "recommended_abs_bias_pct": np.nan,
+                "used_bias_override": False,
             })
             continue
 
         metrics_list = []
         ranking_rows = []
+        holdout_rows = []
 
         # --- Baseline model ---
         if allow_sarima:
             print("  Fitting SARIMA_baseline...")
-            baseline_metrics = evaluate_single_model(
+            baseline_metrics, holdout_df = evaluate_single_model(
                 y=y,
                 exog=None,
                 model_name="SARIMA_baseline",
@@ -1507,8 +3080,12 @@ def main():
                 seasonal_order=seasonal_order,
                 sku=prod,
                 bu=div,
-                rocv_spec=baseline_rocv_spec
+                rocv_spec=baseline_rocv_spec,
+                return_holdout=True,
             )
+            if not holdout_df.empty:
+                holdout_rows.append(holdout_df)
+                holdout_rows_all.append(holdout_df)
             if (
                 baseline_metrics is not None
                 and not np.isnan(baseline_metrics.get("Test_MAE", np.nan))
@@ -1534,14 +3111,18 @@ def main():
 
         # --- ETS baseline ---
         print("  Fitting ETS_baseline...")
-        ets_metrics = evaluate_ets_model(
+        ets_metrics, holdout_df = evaluate_ets_model(
             y=y,
             model_name="ETS_baseline",
             horizon=test_horizon,
             sku=prod,
             bu=div,
-            rocv_spec=baseline_rocv_spec
+            rocv_spec=baseline_rocv_spec,
+            return_holdout=True,
         )
+        if not holdout_df.empty:
+            holdout_rows.append(holdout_df)
+            holdout_rows_all.append(holdout_df)
         metrics_list.append(ets_metrics)
         ranking_rows.append({
             "Product": prod,
@@ -1568,22 +3149,24 @@ def main():
                     non_nan = exog_clean_full.dropna()
                     exog_invalid = (len(non_nan) == 0) or (non_nan.nunique() <= 1)
                     rocv_spec = None if exog_invalid else build_rocv_spec(y, exog_series=exog_clean_full)
-                    metrics_list.append(
-                        evaluate_single_model(
-                            y=y,
-                            exog=exog_series,
-                            model_name=f"SARIMAX_{col}",
+                    metrics_row, holdout_df = evaluate_single_model(
+                        y=y,
+                        exog=exog_series,
+                        model_name=f"SARIMAX_{col}",
                         horizon=test_horizon,
                         order=order,
                         seasonal_order=seasonal_order,
                         sku=prod,
-                            bu=div,
-                            exog_clean_full=exog_clean_full,
-                            rocv_spec=rocv_spec,
-                            exog_invalid=exog_invalid
-                        )
+                        bu=div,
+                        exog_clean_full=exog_clean_full,
+                        rocv_spec=rocv_spec,
+                        exog_invalid=exog_invalid,
+                        return_holdout=True,
                     )
-                    metrics_row = metrics_list[-1]
+                    metrics_list.append(metrics_row)
+                    if not holdout_df.empty:
+                        holdout_rows.append(holdout_df)
+                        holdout_rows_all.append(holdout_df)
                     ranking_rows.append({
                         "Product": prod,
                         "Division": div,
@@ -1611,22 +3194,24 @@ def main():
                     non_nan = exog_clean_full.dropna()
                     exog_invalid = (len(non_nan) == 0) or (non_nan.nunique() <= 1)
                     rocv_spec = None if exog_invalid else build_rocv_spec(y, exog_series=exog_clean_full)
-                    metrics_list.append(
-                        evaluate_single_model(
-                            y=y,
-                            exog=exog_series,
-                            model_name=f"SARIMAX_{col}",
+                    metrics_row, holdout_df = evaluate_single_model(
+                        y=y,
+                        exog=exog_series,
+                        model_name=f"SARIMAX_{col}",
                         horizon=test_horizon,
                         order=order,
                         seasonal_order=seasonal_order,
                         sku=prod,
-                            bu=div,
-                            exog_clean_full=exog_clean_full,
-                            rocv_spec=rocv_spec,
-                            exog_invalid=exog_invalid
-                        )
+                        bu=div,
+                        exog_clean_full=exog_clean_full,
+                        rocv_spec=rocv_spec,
+                        exog_invalid=exog_invalid,
+                        return_holdout=True,
                     )
-                    metrics_row = metrics_list[-1]
+                    metrics_list.append(metrics_row)
+                    if not holdout_df.empty:
+                        holdout_rows.append(holdout_df)
+                        holdout_rows_all.append(holdout_df)
                     ranking_rows.append({
                         "Product": prod,
                         "Division": div,
@@ -1654,22 +3239,24 @@ def main():
                     non_nan = exog_clean_full.dropna()
                     exog_invalid = (len(non_nan) == 0) or (non_nan.nunique() <= 1)
                     rocv_spec = None if exog_invalid else build_rocv_spec(y, exog_series=exog_clean_full)
-                    metrics_list.append(
-                        evaluate_single_model(
-                            y=y,
-                            exog=exog_series,
-                            model_name=f"SARIMAX_{col}",
+                    metrics_row, holdout_df = evaluate_single_model(
+                        y=y,
+                        exog=exog_series,
+                        model_name=f"SARIMAX_{col}",
                         horizon=test_horizon,
                         order=order,
                         seasonal_order=seasonal_order,
                         sku=prod,
-                            bu=div,
-                            exog_clean_full=exog_clean_full,
-                            rocv_spec=rocv_spec,
-                            exog_invalid=exog_invalid
-                        )
+                        bu=div,
+                        exog_clean_full=exog_clean_full,
+                        rocv_spec=rocv_spec,
+                        exog_invalid=exog_invalid,
+                        return_holdout=True,
                     )
-                    metrics_row = metrics_list[-1]
+                    metrics_list.append(metrics_row)
+                    if not holdout_df.empty:
+                        holdout_rows.append(holdout_df)
+                        holdout_rows_all.append(holdout_df)
                     ranking_rows.append({
                         "Product": prod,
                         "Division": div,
@@ -1697,22 +3284,24 @@ def main():
                     non_nan = exog_clean_full.dropna()
                     exog_invalid = (len(non_nan) == 0) or (non_nan.nunique() <= 1)
                     rocv_spec = None if exog_invalid else build_rocv_spec(y, exog_series=exog_clean_full)
-                    metrics_list.append(
-                        evaluate_single_model(
-                            y=y,
-                            exog=exog_series,
-                            model_name=f"SARIMAX_{col}",
-                            horizon=test_horizon,
-                            order=order,
-                            seasonal_order=seasonal_order,
-                            sku=prod,
-                            bu=div,
-                            exog_clean_full=exog_clean_full,
-                            rocv_spec=rocv_spec,
-                            exog_invalid=exog_invalid
-                        )
+                    metrics_row, holdout_df = evaluate_single_model(
+                        y=y,
+                        exog=exog_series,
+                        model_name=f"SARIMAX_{col}",
+                        horizon=test_horizon,
+                        order=order,
+                        seasonal_order=seasonal_order,
+                        sku=prod,
+                        bu=div,
+                        exog_clean_full=exog_clean_full,
+                        rocv_spec=rocv_spec,
+                        exog_invalid=exog_invalid,
+                        return_holdout=True,
                     )
-                    metrics_row = metrics_list[-1]
+                    metrics_list.append(metrics_row)
+                    if not holdout_df.empty:
+                        holdout_rows.append(holdout_df)
+                        holdout_rows_all.append(holdout_df)
                     ranking_rows.append({
                         "Product": prod,
                         "Division": div,
@@ -1740,22 +3329,24 @@ def main():
                     non_nan = exog_clean_full.dropna()
                     exog_invalid = (len(non_nan) == 0) or (non_nan.nunique() <= 1)
                     rocv_spec = None if exog_invalid else build_rocv_spec(y, exog_series=exog_clean_full)
-                    metrics_list.append(
-                        evaluate_single_model(
-                            y=y,
-                            exog=exog_series,
-                            model_name=f"SARIMAX_{col}",
-                            horizon=test_horizon,
-                            order=order,
-                            seasonal_order=seasonal_order,
-                            sku=prod,
-                            bu=div,
-                            exog_clean_full=exog_clean_full,
-                            rocv_spec=rocv_spec,
-                            exog_invalid=exog_invalid
-                        )
+                    metrics_row, holdout_df = evaluate_single_model(
+                        y=y,
+                        exog=exog_series,
+                        model_name=f"SARIMAX_{col}",
+                        horizon=test_horizon,
+                        order=order,
+                        seasonal_order=seasonal_order,
+                        sku=prod,
+                        bu=div,
+                        exog_clean_full=exog_clean_full,
+                        rocv_spec=rocv_spec,
+                        exog_invalid=exog_invalid,
+                        return_holdout=True,
                     )
-                    metrics_row = metrics_list[-1]
+                    metrics_list.append(metrics_row)
+                    if not holdout_df.empty:
+                        holdout_rows.append(holdout_df)
+                        holdout_rows_all.append(holdout_df)
                     ranking_rows.append({
                         "Product": prod,
                         "Division": div,
@@ -1783,22 +3374,24 @@ def main():
                     non_nan = exog_clean_full.dropna()
                     exog_invalid = (len(non_nan) == 0) or (non_nan.nunique() <= 1)
                     rocv_spec = None if exog_invalid else build_rocv_spec(y, exog_series=exog_clean_full)
-                    metrics_list.append(
-                        evaluate_single_model(
-                            y=y,
-                            exog=exog_series,
-                            model_name=f"SARIMAX_{col}",
-                            horizon=test_horizon,
-                            order=order,
-                            seasonal_order=seasonal_order,
-                            sku=prod,
-                            bu=div,
-                            exog_clean_full=exog_clean_full,
-                            rocv_spec=rocv_spec,
-                            exog_invalid=exog_invalid
-                        )
+                    metrics_row, holdout_df = evaluate_single_model(
+                        y=y,
+                        exog=exog_series,
+                        model_name=f"SARIMAX_{col}",
+                        horizon=test_horizon,
+                        order=order,
+                        seasonal_order=seasonal_order,
+                        sku=prod,
+                        bu=div,
+                        exog_clean_full=exog_clean_full,
+                        rocv_spec=rocv_spec,
+                        exog_invalid=exog_invalid,
+                        return_holdout=True,
                     )
-                    metrics_row = metrics_list[-1]
+                    metrics_list.append(metrics_row)
+                    if not holdout_df.empty:
+                        holdout_rows.append(holdout_df)
+                        holdout_rows_all.append(holdout_df)
                     ranking_rows.append({
                         "Product": prod,
                         "Division": div,
@@ -1826,22 +3419,24 @@ def main():
                     non_nan = exog_clean_full.dropna()
                     exog_invalid = (len(non_nan) == 0) or (non_nan.nunique() <= 1)
                     rocv_spec = None if exog_invalid else build_rocv_spec(y, exog_series=exog_clean_full)
-                    metrics_list.append(
-                        evaluate_single_model(
-                            y=y,
-                            exog=exog_series,
-                            model_name=f"SARIMAX_{col}",
-                            horizon=test_horizon,
-                            order=order,
-                            seasonal_order=seasonal_order,
-                            sku=prod,
-                            bu=div,
-                            exog_clean_full=exog_clean_full,
-                            rocv_spec=rocv_spec,
-                            exog_invalid=exog_invalid
-                        )
+                    metrics_row, holdout_df = evaluate_single_model(
+                        y=y,
+                        exog=exog_series,
+                        model_name=f"SARIMAX_{col}",
+                        horizon=test_horizon,
+                        order=order,
+                        seasonal_order=seasonal_order,
+                        sku=prod,
+                        bu=div,
+                        exog_clean_full=exog_clean_full,
+                        rocv_spec=rocv_spec,
+                        exog_invalid=exog_invalid,
+                        return_holdout=True,
                     )
-                    metrics_row = metrics_list[-1]
+                    metrics_list.append(metrics_row)
+                    if not holdout_df.empty:
+                        holdout_rows.append(holdout_df)
+                        holdout_rows_all.append(holdout_df)
                     ranking_rows.append({
                         "Product": prod,
                         "Division": div,
@@ -1860,8 +3455,62 @@ def main():
 
         # --- ML challenger (GradientBoostingRegressor) ---
         if enable_ml:
-            print("  Evaluating ML_GBR...")
-            ml_metrics = evaluate_ml_candidate(df_sku, horizon=test_horizon)
+            use_pipeline_ml = False
+            ml_metrics = None
+            pipeline_reason = pipeline_skip_reason
+            if summary_product.empty and not pipeline_reason:
+                pipeline_reason = "No summary data for product/BU."
+            if pipeline_history.empty and not pipeline_reason:
+                pipeline_reason = "No pipeline history rows."
+
+            if not pipeline_reason and feature_mode is not None:
+                print(f"  Evaluating {PIPELINE_ML_MODEL_NAME}...")
+                actuals_df = df_sku.reset_index()[[COL_DATE, COL_ACTUALS]].copy()
+                actuals_df = actuals_df.rename(columns={COL_DATE: "Month", COL_ACTUALS: "Actuals"})
+                actuals_df["Month"] = month_start(actuals_df["Month"])
+                actuals_series = actuals_df.set_index("Month")["Actuals"].sort_index()
+                ml_metrics, holdout_df = evaluate_ml_pipeline_candidate(
+                    actuals_df=actuals_df,
+                    actuals_series=actuals_series,
+                    pipeline_history=pipeline_history,
+                    feature_mode=feature_mode,
+                    summary_df=summary_product,
+                    holdout_months=test_horizon,
+                    sku=prod,
+                    bu=div,
+                    return_holdout=True,
+                )
+                if not holdout_df.empty:
+                    holdout_rows.append(holdout_df)
+                    holdout_rows_all.append(holdout_df)
+                if ml_metrics.get("Skip_Reason"):
+                    pipeline_reason = ml_metrics["Skip_Reason"]
+                else:
+                    use_pipeline_ml = True
+
+            if pipeline_reason:
+                skipped_products.append(
+                    {
+                        "Product": prod,
+                        "Division": div,
+                        "Model": PIPELINE_ML_MODEL_NAME,
+                        "Reason": pipeline_reason,
+                    }
+                )
+
+            if not use_pipeline_ml:
+                print("  Evaluating ML_GBR...")
+                ml_metrics, holdout_df = evaluate_ml_candidate(
+                    df_sku,
+                    horizon=test_horizon,
+                    sku=prod,
+                    bu=div,
+                    return_holdout=True,
+                )
+                if not holdout_df.empty:
+                    holdout_rows.append(holdout_df)
+                    holdout_rows_all.append(holdout_df)
+
             metrics_list.append(ml_metrics)
             if ml_metrics.get("Skip_Reason"):
                 print(f"  -> ML skipped: {ml_metrics['Skip_Reason']}")
@@ -1884,8 +3533,13 @@ def main():
         # --- Prophet challenger ---
         if enable_prophet:
             print("  Evaluating PROPHET...")
-            prophet_metrics = _evaluate_prophet_metrics(y, horizon=test_horizon, sku=prod, bu=div)
+            prophet_metrics, holdout_df = _evaluate_prophet_metrics(
+                y, horizon=test_horizon, sku=prod, bu=div, return_holdout=True
+            )
             metrics_list.append(prophet_metrics)
+            if not holdout_df.empty:
+                holdout_rows.append(holdout_df)
+                holdout_rows_all.append(holdout_df)
             if prophet_metrics.get("Skip_Reason"):
                 print(f"  -> Prophet skipped: {prophet_metrics['Skip_Reason']}")
             ranking_rows.append({
@@ -1905,16 +3559,45 @@ def main():
             })
 
         # --- Choose best model using recommended logic ---
-        best_model, baseline, selection_reason, decision = choose_recommended_model(metrics_list)
-        flags_by_model = decision.get("flags_by_model", {})
-        for row in ranking_rows:
-            flags = flags_by_model.get(row["Model"], {})
-            row["passes_accuracy"] = flags.get("passes_accuracy")
-            row["passes_rocv_hard"] = flags.get("passes_rocv_hard")
-            row["in_preferred_band"] = flags.get("in_preferred_band")
-            row["Accepted_by_rules"] = bool(
-                flags.get("passes_accuracy") and flags.get("passes_rocv_hard")
-            )
+        metrics_df = pd.DataFrame(ranking_rows)
+        holdout_df = pd.concat(holdout_rows, ignore_index=True) if holdout_rows else pd.DataFrame()
+        selection_summary, ranking_df = select_recommended_model(
+            metrics_df,
+            holdout_df,
+            mae_tolerance=MAE_TOLERANCE,
+            rmse_tolerance=RMSE_TOLERANCE,
+            rocv_hard_multiplier=ROCV_HARD_MULTIPLIER,
+            da_min_periods=DA_MIN_PERIODS,
+            da_improvement_pp=DA_IMPROVEMENT_PP,
+            da_close_mae_tol=DA_CLOSE_MAE_TOL,
+            return_rankings=True,
+        )
+        summary_row = selection_summary.iloc[0] if not selection_summary.empty else {}
+        selection_reason = summary_row.get("Reason", "No valid model metrics available.")
+        recommended_model_name = summary_row.get("Recommended_Model")
+        baseline_model_name = summary_row.get("Baseline_Model")
+        best_model = next((m for m in metrics_list if m.get("Model") == recommended_model_name), None)
+        baseline = next((m for m in metrics_list if m.get("Model") == baseline_model_name), None)
+
+        if not ranking_df.empty:
+            ranking_lookup = ranking_df.set_index("Model")
+            for row in ranking_rows:
+                if row["Model"] in ranking_lookup.index:
+                    flags = ranking_lookup.loc[row["Model"]]
+                    row["passes_accuracy"] = bool(flags.get("passes_accuracy"))
+                    row["passes_rocv_sanity"] = bool(flags.get("passes_rocv_sanity"))
+                    row["candidate"] = bool(flags.get("candidate"))
+                    row["qualifies_mae_close"] = bool(flags.get("qualifies_mae_close"))
+                    row["qualifies_bias"] = bool(flags.get("qualifies_bias"))
+                    row["qualifies_rmse_close"] = bool(flags.get("qualifies_rmse_close"))
+                    row["used_bias_override"] = bool(flags.get("used_bias_override"))
+                    row["DA"] = flags.get("DA", np.nan)
+                    row["DA_Valid_Periods"] = flags.get("DA_Valid_Periods", np.nan)
+                    row["bias"] = flags.get("bias", np.nan)
+                    row["abs_bias"] = flags.get("abs_bias", np.nan)
+                    row["bias_pct"] = flags.get("bias_pct", np.nan)
+                    row["abs_bias_pct"] = flags.get("abs_bias_pct", np.nan)
+                    row["Accepted_by_rules"] = bool(flags.get("candidate"))
 
         # Identify best SARIMAX candidate by Test_MAE for regressor fallback.
         sarimax_candidates = [
@@ -1969,17 +3652,26 @@ def main():
                 "baseline_model": None,
                 "baseline_mae": np.nan,
                 "baseline_rocv": np.nan,
+                "baseline_abs_bias": np.nan,
+                "baseline_abs_bias_pct": np.nan,
                 "mae_cutoff": np.nan,
                 "rmse_cutoff": np.nan,
                 "rocv_hard_max": np.nan,
                 "rocv_preferred_min": np.nan,
                 "rocv_preferred_max": np.nan,
+                "recommended_bias": np.nan,
+                "recommended_abs_bias": np.nan,
+                "recommended_bias_pct": np.nan,
+                "recommended_abs_bias_pct": np.nan,
+                "used_bias_override": False,
             })
             continue
 
         # Baseline info
         baseline_mae = baseline["Test_MAE"] if baseline is not None else np.nan
+        baseline_rmse = baseline["Test_RMSE"] if baseline is not None else np.nan
         baseline_rocv = baseline["ROCV_MAE"] if baseline is not None else np.nan
+        baseline_da = summary_row.get("baseline_DA", np.nan) if isinstance(summary_row, pd.Series) else np.nan
 
         chosen_mae = best_model["Test_MAE"]
         chosen_rmse = best_model["Test_RMSE"]
@@ -2074,14 +3766,25 @@ def main():
             "Division": div,
             "Recommended_Model": best_model["Model"],
             "Reason": selection_reason,
-            "baseline_model": decision.get("baseline_model"),
-            "baseline_mae": decision.get("baseline_mae"),
-            "baseline_rocv": decision.get("baseline_rocv"),
-            "mae_cutoff": decision.get("mae_cutoff"),
-            "rmse_cutoff": decision.get("rmse_cutoff"),
-            "rocv_hard_max": decision.get("rocv_hard_max"),
-            "rocv_preferred_min": decision.get("rocv_preferred_min"),
-            "rocv_preferred_max": decision.get("rocv_preferred_max"),
+            "baseline_model": summary_row.get("Baseline_Model"),
+            "baseline_mae": summary_row.get("baseline_mae"),
+            "baseline_rmse": summary_row.get("baseline_rmse"),
+            "baseline_rocv": summary_row.get("baseline_rocv"),
+            "baseline_DA": summary_row.get("baseline_DA"),
+            "baseline_abs_bias": summary_row.get("baseline_abs_bias"),
+            "baseline_abs_bias_pct": summary_row.get("baseline_abs_bias_pct"),
+            "mae_cutoff": summary_row.get("mae_cutoff"),
+            "rmse_cutoff": summary_row.get("rmse_cutoff"),
+            "rocv_hard_max": summary_row.get("rocv_hard_max"),
+            "recommended_mae": summary_row.get("recommended_mae"),
+            "recommended_rmse": summary_row.get("recommended_rmse"),
+            "recommended_rocv": summary_row.get("recommended_rocv"),
+            "recommended_DA": summary_row.get("recommended_DA"),
+            "recommended_bias": summary_row.get("recommended_bias"),
+            "recommended_abs_bias": summary_row.get("recommended_abs_bias"),
+            "recommended_bias_pct": summary_row.get("recommended_bias_pct"),
+            "recommended_abs_bias_pct": summary_row.get("recommended_abs_bias_pct"),
+            "used_bias_override": summary_row.get("used_bias_override"),
         })
         results_rows.append({
             "Product": prod,
@@ -2092,10 +3795,13 @@ def main():
             "Best_NonBaseline_Regressor_Name": best_nonbaseline_reg_name,
             "Best_NonBaseline_Regressor_Lag": best_nonbaseline_reg_lag,
             "Baseline_MAE": baseline_mae,
+            "Baseline_RMSE": baseline_rmse,
             "Baseline_ROCV_MAE": baseline_rocv,
+            "Baseline_DA": baseline_da,
             "Chosen_MAE": chosen_mae,
             "Chosen_RMSE": chosen_rmse,
             "Chosen_ROCV_MAE": chosen_rocv,
+            "Chosen_DA": summary_row.get("recommended_DA") if isinstance(summary_row, pd.Series) else np.nan,
             "MAE_Improvement_Pct": mae_improvement_pct,
             "Regressor_Name": regressor_name,
             "Regressor_Lag": regressor_lag,
@@ -2126,8 +3832,8 @@ def main():
         col_order.append("Model_Type")
     col_order.extend([
         "Best_NonBaseline_Model", "Accepted_by_rules",
-        "Baseline_MAE", "Baseline_ROCV_MAE",
-        "Chosen_MAE", "Chosen_RMSE", "Chosen_ROCV_MAE",
+        "Baseline_MAE", "Baseline_RMSE", "Baseline_ROCV_MAE", "Baseline_DA",
+        "Chosen_MAE", "Chosen_RMSE", "Chosen_ROCV_MAE", "Chosen_DA",
         "MAE_Improvement_Pct",
         "Regressor_Name", "Regressor_Lag",
         "Best_NonBaseline_Regressor_Name", "Best_NonBaseline_Regressor_Lag",
@@ -2155,6 +3861,12 @@ def main():
             .rank(method="first")
         )
 
+    holdout_ts = pd.concat(holdout_rows_all, ignore_index=True) if holdout_rows_all else pd.DataFrame()
+    if not holdout_ts.empty:
+        holdout_ts["Date"] = pd.to_datetime(holdout_ts["Date"], errors="coerce")
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        holdout_ts.to_csv(HOLDOUT_TS_CSV, index=False)
+
     with pd.ExcelWriter(OUTPUT_FILE) as writer:
         df_results.to_excel(writer, index=False, sheet_name="Model_Summary")
         if not df_recommended.empty:
@@ -2165,12 +3877,16 @@ def main():
                 "Reason",
                 "baseline_model",
                 "baseline_mae",
+                "baseline_rmse",
                 "baseline_rocv",
+                "baseline_DA",
                 "mae_cutoff",
                 "rmse_cutoff",
                 "rocv_hard_max",
-                "rocv_preferred_min",
-                "rocv_preferred_max",
+                "recommended_mae",
+                "recommended_rmse",
+                "recommended_rocv",
+                "recommended_DA",
             ]
             for col in recommended_cols:
                 if col not in df_recommended.columns:
@@ -2179,15 +3895,31 @@ def main():
             df_recommended.to_excel(writer, index=False, sheet_name="recommended_model_summary")
         if not df_rankings.empty:
             df_rankings.to_excel(writer, index=False, sheet_name="Model_Rankings")
+        if not holdout_ts.empty:
+            holdout_ts.to_excel(writer, index=False, sheet_name=HOLDOUT_TS_SHEET)
         if skipped_no_order:
             pd.DataFrame(skipped_no_order).to_excel(
                 writer, index=False, sheet_name="Skipped_No_Order"
             )
 
+    if skipped_products:
+        skipped_path = BASE_DIR / "skipped_products.csv"
+        pd.DataFrame(skipped_products).to_csv(skipped_path, index=False)
+
     if skipped_no_order:
         print("\nSkipped SKUs (no order found):")
         for row in skipped_no_order:
             print(f"  - Product: {row['Product']}, Division: {row['Division']}")
+
+    if not holdout_ts.empty:
+        print(f"Holdout forecast-vs-actuals written to: {HOLDOUT_TS_CSV}")
+
+    if args.compare_model_selection:
+        try:
+            import compare_model_selection
+            compare_model_selection.main()
+        except Exception as exc:
+            print(f"[WARN] Model selection comparison failed: {exc}")
 
     print(f"\nDone. Summary written to: {OUTPUT_FILE}")
 

@@ -28,8 +28,8 @@ except Exception:
 # ===========================
 
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
-INPUT_FILE = "all_products_with_sf_and_bookings.xlsx"
-REVISED_ACTUALS_FILE = "all_products_with_sf_and_bookings_revised.xlsx"
+INPUT_FILE = "all_products_actuals_and_bookings.xlsx"
+REVISED_ACTUALS_FILE = "all_products_actuals_and_bookings_revised.xlsx"
 REVISED_ACTUALS_SHEET = "Revised Actuals"
 SUMMARY_FILE = "sarima_multi_sku_summary.xlsx"          # chosen model per SKU
 ORDER_FILE = "sarimax_order_search_summary.xlsx"        # chosen (p,d,q)(P,D,Q,s) per SKU

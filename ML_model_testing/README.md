@@ -9,7 +9,7 @@ snapshot month), reports MAE by horizon, and produces a forward 12-month forecas
 the latest snapshot.
 
 ## Inputs
-- Actuals: `all_products_with_sf_and_bookings.xlsx`
+- Actuals: `all_products_actuals_and_bookings.xlsx`
   - Required columns: `Product`, `Division`, `Month`, `Actuals`
 - Pipeline snapshots: `Merged Salesforce Pipeline *.xlsx`
   - Required columns: `Month` (snapshot month), `Close Date`, `Business Unit`,

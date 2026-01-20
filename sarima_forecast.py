@@ -5,8 +5,10 @@ warnings.filterwarnings("ignore", category=UserWarning)
 import ast
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -15,6 +17,8 @@ from statsmodels.tsa.exponential_smoothing.ets import ETSModel
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
 try:
     from prophet import Prophet
     PROPHET_AVAILABLE = True
@@ -27,8 +31,11 @@ except Exception:
 # CONFIG
 # ===========================
 
-INPUT_FILE = "all_products_with_sf_and_bookings.xlsx"
-REVISED_ACTUALS_FILE = "all_products_with_sf_and_bookings_revised.xlsx"
+BASE_DIR = Path(__file__).resolve().parent
+SALESFORCE_DATA_DIR = BASE_DIR / "salesforce_data"
+
+INPUT_FILE = "all_products_actuals_and_bookings.xlsx"
+REVISED_ACTUALS_FILE = "all_products_actuals_and_bookings_revised.xlsx"
 REVISED_ACTUALS_SHEET = "Revised Actuals"
 SUMMARY_FILE = "sarima_multi_sku_summary.xlsx"          # chosen model per SKU
 ORDER_FILE = "sarimax_order_search_summary.xlsx"        # chosen (p,d,q)(P,D,Q,s) per SKU
@@ -39,6 +46,16 @@ OUTPUT_FILE_BASE = "stats_model_forecasts.xlsx"
 FILL_MISSING_FUTURE_EXOG_WITH_LAST = True
 ENABLE_ML_CHALLENGER = True
 ENABLE_PROPHET_CHALLENGER = True
+PIPELINE_FILES = sorted(SALESFORCE_DATA_DIR.glob("Merged Salesforce Pipeline *.xlsx"))
+SUMMARY_REPORT_NAME = "Salesforce Pipeline Monthly Summary.xlsx"
+SUMMARY_PATH = SALESFORCE_DATA_DIR / SUMMARY_REPORT_NAME
+PRODUCT_CATALOG_PATH = BASE_DIR / "product_catalog_master.xlsx"
+SF_PRODUCT_REFERENCE_PATHS = [
+    SALESFORCE_DATA_DIR / "sf_product_reference_key.csv",
+    BASE_DIR / "sf_product_reference_key.csv",
+    BASE_DIR / "ML_model_testing" / "sf_product_reference_key.csv",
+]
+PIPELINE_ML_MODEL_NAME = "ML_GBR_PIPELINE"
 
 COL_PRODUCT = "Product"
 COL_DIVISION = "Division"
@@ -69,6 +86,7 @@ MODEL_LABELS = {
     "baseline_sarima": "Seasonal Baseline",
     "baseline_ets": "ETS Baseline",
     "ml_gbr": "ML GBR",
+    "ml_gbr_pipeline": "ML GBR Pipeline",
     "prophet": "PROPHET",
 }
 
@@ -168,6 +186,978 @@ def mark_prelaunch_actuals_as_missing(
     return df
 
 
+@dataclass
+class ModelBundle:
+    adjustment_model: Optional[Pipeline]
+    adjustment_features: List[str]
+
+
+def month_start(series: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(series, errors="coerce")
+    return dt.dt.to_period("M").dt.to_timestamp()
+
+
+def parse_snapshot_month(series: pd.Series) -> pd.Series:
+    raw = series.astype(str).str.strip()
+    dt = pd.to_datetime(raw, format="%Y-%m", errors="coerce")
+    if dt.isna().any():
+        mask = dt.isna()
+        dt2 = pd.to_datetime(raw[mask], errors="coerce")
+        dt.loc[mask] = dt2
+    return dt.dt.to_period("M").dt.to_timestamp()
+
+
+def parse_close_date(series: pd.Series) -> pd.Series:
+    raw = series.astype(str).str.strip()
+    dt = pd.to_datetime(raw, format="%m/%d/%Y", errors="coerce")
+    if dt.isna().any():
+        mask = dt.isna()
+        dt2 = pd.to_datetime(raw[mask], errors="coerce")
+        dt.loc[mask] = dt2
+    return dt.dt.to_period("M").dt.to_timestamp()
+
+
+def month_diff(later: pd.Timestamp, earlier: pd.Timestamp) -> int:
+    return (later.year - earlier.year) * 12 + (later.month - earlier.month)
+
+
+def safe_nanmean(values: List[Optional[Union[float, int]]]) -> float:
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return np.nan
+    if np.isnan(arr).all():
+        return np.nan
+    return float(np.nanmean(arr))
+
+
+def normalize_code(value: object) -> str:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return str(value).strip()
+    raw = str(value).strip()
+    if raw.endswith(".0") and raw.replace(".", "", 1).isdigit():
+        raw = raw[:-2]
+    return raw
+
+
+def load_feature_mode(product_id: str, division: str, catalog: pd.DataFrame) -> str:
+    group_key = (
+        catalog["group_key_norm"]
+        if "group_key_norm" in catalog.columns
+        else catalog["group_key"].astype(str).apply(normalize_code)
+    )
+    business_unit = (
+        catalog["business_unit_code_str"]
+        if "business_unit_code_str" in catalog.columns
+        else catalog["business_unit_code"].astype(str)
+    )
+    match = catalog[(group_key == normalize_code(product_id)) & (business_unit == division)]
+    if match.empty or "salesforce_feature_mode" not in match.columns:
+        raise RuntimeError(
+            f"salesforce_feature_mode not found for product {product_id} / {division}."
+        )
+    mode_raw = str(match.iloc[0]["salesforce_feature_mode"]).strip().lower()
+    if mode_raw == "dollars":
+        mode_raw = "revenue"
+    if mode_raw not in {"quantity", "revenue"}:
+        raise RuntimeError(f"Unsupported salesforce_feature_mode: {mode_raw}")
+    return mode_raw
+
+
+def load_sf_product_reference() -> pd.DataFrame:
+    for path in SF_PRODUCT_REFERENCE_PATHS:
+        if path.exists():
+            df = pd.read_csv(path)
+            required = {"business_unit_code", "group_key", "salesforce_product_name"}
+            if not required.issubset(set(df.columns)):
+                raise RuntimeError(
+                    "sf_product_reference_key.csv missing required columns: "
+                    f"{', '.join(sorted(required))}."
+                )
+            df["business_unit_code"] = df["business_unit_code"].astype(str)
+            df["group_key"] = df["group_key"].apply(normalize_code)
+            df["salesforce_product_name"] = df["salesforce_product_name"].apply(normalize_code)
+            df = df[df["group_key"] != ""]
+            return df
+    return pd.DataFrame()
+
+
+def load_summary_report(path: Path) -> pd.DataFrame:
+    df = pd.read_excel(path, dtype={"group_key": str, "BU": str})
+    if "Month" in df.columns:
+        df["Month"] = month_start(df["Month"])
+    df["group_key"] = df["group_key"].apply(normalize_code)
+    df["BU"] = df["BU"].astype(str)
+    return df
+
+
+def filter_summary_product(df: pd.DataFrame, product_id: str, division: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    product_key = normalize_code(product_id)
+    division_key = str(division)
+    product_mask = df["group_key"].apply(normalize_code) == product_key
+    division_mask = df["BU"].astype(str) == division_key
+    return df[product_mask & division_mask].copy()
+
+
+def filter_pipeline_product(
+    df: pd.DataFrame, product_id: str, sf_codes: Optional[List[str]] = None
+) -> pd.DataFrame:
+    product_mask = pd.Series([False] * len(df), index=df.index)
+    codes = {normalize_code(product_id)}
+    if sf_codes:
+        codes.update(normalize_code(code) for code in sf_codes if normalize_code(code))
+
+    if "Product Code" in df.columns:
+        product_codes = (
+            df["Product_Code_num"]
+            if "Product_Code_num" in df.columns
+            else pd.to_numeric(df["Product Code"], errors="coerce")
+        )
+        numeric_codes = []
+        for code in codes:
+            if code.replace(".", "", 1).isdigit():
+                numeric_codes.append(float(code))
+        if numeric_codes:
+            product_mask |= product_codes.isin(numeric_codes)
+        product_norm = (
+            df["Product_Code_norm"]
+            if "Product_Code_norm" in df.columns
+            else df["Product Code"].apply(normalize_code)
+        )
+        product_mask |= product_norm.isin(codes)
+    if "Current OSC Product Name" in df.columns:
+        name_norm = (
+            df["Current_OSC_Product_Name_norm"]
+            if "Current_OSC_Product_Name_norm" in df.columns
+            else df["Current OSC Product Name"].apply(normalize_code)
+        )
+        product_mask |= name_norm.isin(codes)
+    return df[product_mask].copy()
+
+
+def load_pipeline_history(
+    product_id: str,
+    division: str,
+    sf_codes: Optional[List[str]] = None,
+    pipeline_all: Optional[pd.DataFrame] = None,
+    pipeline_preprocessed: bool = False,
+) -> pd.DataFrame:
+    frames = []
+    slip_frames = []
+
+    if pipeline_all is None:
+        sources: List[pd.DataFrame] = []
+        for path in PIPELINE_FILES:
+            sources.append(pd.read_excel(path))
+    elif "_source_file" in pipeline_all.columns:
+        sources = [
+            pipeline_all[pipeline_all["_source_file"] == source].copy()
+            for source in pipeline_all["_source_file"].dropna().unique()
+        ]
+    else:
+        sources = [pipeline_all.copy()]
+
+    for df in sources:
+        if "Business Unit" in df.columns:
+            df = df[df["Business Unit"] == division]
+        df = filter_pipeline_product(df, product_id, sf_codes=sf_codes)
+        if df.empty:
+            continue
+        if not pipeline_preprocessed:
+            if "snapshot_month" not in df.columns and "Month" in df.columns:
+                df["snapshot_month"] = parse_snapshot_month(df["Month"])
+            if "target_month" not in df.columns and "Close Date" in df.columns:
+                df["target_month"] = parse_close_date(df["Close Date"])
+            if "Probability" in df.columns:
+                df["Probability"] = pd.to_numeric(df["Probability"], errors="coerce")
+            if "Total Price" in df.columns:
+                df["Total Price"] = pd.to_numeric(df["Total Price"], errors="coerce")
+            if "Factored Quantity" in df.columns:
+                df["Factored Quantity"] = pd.to_numeric(df["Factored Quantity"], errors="coerce")
+            if "Factored Revenue" in df.columns:
+                df["Factored Revenue"] = pd.to_numeric(df["Factored Revenue"], errors="coerce")
+            if "Quantity" in df.columns:
+                df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce")
+            if "Quantity W/ Decimal" in df.columns:
+                df["Quantity W/ Decimal"] = pd.to_numeric(
+                    df["Quantity W/ Decimal"], errors="coerce"
+                )
+
+        if "target_month" in df.columns:
+            df = df.dropna(subset=["target_month"])
+        else:
+            continue
+
+        quantity_col = None
+        if "Quantity" in df.columns and df["Quantity"].notna().any():
+            quantity_col = "Quantity"
+        elif "Quantity W/ Decimal" in df.columns and df["Quantity W/ Decimal"].notna().any():
+            quantity_col = "Quantity W/ Decimal"
+        else:
+            quantity_col = "Quantity" if "Quantity" in df.columns else "Quantity W/ Decimal"
+
+        if "Probability" in df.columns:
+            prob = df["Probability"] / 100.0
+            df["stage_weighted_qty"] = df[quantity_col] * prob
+            if "Total Price" in df.columns:
+                df["stage_weighted_revenue"] = df["Total Price"] * prob
+            elif "Factored Revenue" in df.columns:
+                df["stage_weighted_revenue"] = df["Factored Revenue"]
+            else:
+                df["stage_weighted_revenue"] = np.nan
+        else:
+            df["stage_weighted_qty"] = np.nan
+            df["stage_weighted_revenue"] = np.nan
+
+        agg = (
+            df.groupby(["snapshot_month", "target_month"], dropna=False)
+            .agg(
+                pipeline_qty=(quantity_col, "sum"),
+                pipeline_factored_qty=("Factored Quantity", "sum"),
+                pipeline_factored_revenue=("Factored Revenue", "sum"),
+                pipeline_stage_weighted_qty=("stage_weighted_qty", "sum"),
+                pipeline_stage_weighted_revenue=("stage_weighted_revenue", "sum"),
+            )
+            .reset_index()
+        )
+        frames.append(agg)
+
+        if "Opportunity Name" in df.columns and "Account Name" in df.columns:
+            slip_df = df[
+                [
+                    "snapshot_month",
+                    "target_month",
+                    "Opportunity Name",
+                    "Account Name",
+                ]
+            ].copy()
+            slip_df["opp_key"] = (
+                slip_df["Account Name"].astype(str).str.strip()
+                + "||"
+                + slip_df["Opportunity Name"].astype(str).str.strip()
+            )
+            slip_frames.append(slip_df)
+
+    if not frames:
+        return pd.DataFrame()
+
+    pipeline_history = pd.concat(frames, ignore_index=True)
+
+    slippage_months_by_snapshot = {}
+    if slip_frames:
+        slip_all = pd.concat(slip_frames, ignore_index=True)
+        slip_all = slip_all.dropna(subset=["snapshot_month", "target_month", "opp_key"])
+        slip_all = slip_all.sort_values(["opp_key", "snapshot_month"])
+        slip_all["prior_target_month"] = slip_all.groupby("opp_key")["target_month"].shift(1)
+        prior = slip_all["prior_target_month"]
+        curr = slip_all["target_month"]
+        slip_months = (curr.dt.year - prior.dt.year) * 12 + (curr.dt.month - prior.dt.month)
+        slip_all["slip_months"] = slip_months.where(prior.notna(), np.nan)
+        slip_stats = slip_all.groupby("snapshot_month")["slip_months"].median()
+        slippage_months_by_snapshot = slip_stats.to_dict()
+
+    if slippage_months_by_snapshot:
+        pipeline_history["slippage_months"] = pipeline_history["snapshot_month"].map(
+            slippage_months_by_snapshot
+        )
+    else:
+        pipeline_history["slippage_months"] = np.nan
+
+    return pipeline_history
+
+
+def build_feature_frame(
+    actuals: pd.DataFrame,
+    pipeline: pd.DataFrame,
+    max_horizon: int,
+    feature_mode: str,
+    summary_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    actuals_series = actuals.set_index("Month")["Actuals"].sort_index()
+    actuals_lookup = actuals_series.to_dict()
+    all_actual_months = actuals_series.index
+    if all_actual_months.empty:
+        return pd.DataFrame()
+
+    snapshots = (
+        pipeline["snapshot_month"].dropna().sort_values().unique().tolist()
+        if not pipeline.empty
+        else []
+    )
+    if not snapshots:
+        return pd.DataFrame()
+
+    pipeline_keyed = pipeline.set_index(["snapshot_month", "target_month"])
+
+    summary_features: Dict[pd.Timestamp, Dict[str, float]] = {}
+    summary_cols = [
+        "Sum_Total_Price",
+        "Sum_Quantity",
+        "Open_Opportunities",
+        "New_Opportunities",
+        "Median_Months_Since_Last_Activity",
+        "Open_Not_Modified_90_Days",
+        "Early_Open_Opportunities",
+        "Late_Open_Opportunities",
+        "Open_Expected_Close_0_1_Months",
+        "Open_Expected_Close_2_3_Months",
+        "Open_Expected_Close_4_6_Months",
+        "Open_Expected_Close_7_12_Months",
+        "Open_Expected_Close_13_Plus_Months",
+        "Open_Top_Decile_Count",
+        "Open_Top_Decile_Close_0_3_Months",
+        "Pct_Open_Not_Modified_90_Days",
+        "Early_to_Late_Ratio",
+        "Closed_Won_Count_24m",
+        "Closed_Lost_Count_24m",
+        "Median_Days_To_Close_Won_24m",
+        "Mean_Days_To_Close_Won_24m",
+        "Won_Close_0_3_Count_24m",
+        "Won_Close_4_6_Count_24m",
+        "Won_Close_7_12_Count_24m",
+        "Won_Close_13_Plus_Count_24m",
+        "Closed_Win_Rate_24m",
+        "Pct_Won_Close_0_3_24m",
+        "Pct_Won_Close_4_6_24m",
+        "Pct_Won_Close_7_12_24m",
+        "Pct_Won_Close_13_Plus_24m",
+    ]
+    if summary_df is not None and not summary_df.empty:
+        for _, row in summary_df.iterrows():
+            key = pd.Timestamp(row["Month"])
+            summary_features[key] = {col: row.get(col, np.nan) for col in summary_cols}
+
+    snapshot_metrics = {}
+    snapshot_ts_list = [pd.Timestamp(s) for s in snapshots]
+    for snapshot_ts in snapshot_ts_list:
+        snap_rows = pipeline[pipeline["snapshot_month"] == snapshot_ts].copy()
+        snap_rows = snap_rows[snap_rows["target_month"] >= snapshot_ts]
+        if snap_rows.empty:
+            snapshot_metrics[snapshot_ts] = {}
+            continue
+
+        if feature_mode == "quantity":
+            snap_rows["pipeline_primary"] = snap_rows["pipeline_factored_qty"]
+            snap_rows["pipeline_stage_weighted_primary"] = snap_rows[
+                "pipeline_stage_weighted_qty"
+            ]
+        else:
+            snap_rows["pipeline_primary"] = snap_rows["pipeline_factored_revenue"]
+            snap_rows["pipeline_stage_weighted_primary"] = snap_rows[
+                "pipeline_stage_weighted_revenue"
+            ]
+
+        slip_months = snap_rows["slippage_months"].median()
+        slip_months = int(round(slip_months)) if pd.notna(slip_months) else 0
+        if slip_months:
+            snap_rows["slip_target_month"] = snap_rows["target_month"] + pd.DateOffset(
+                months=slip_months
+            )
+        else:
+            snap_rows["slip_target_month"] = snap_rows["target_month"]
+
+        slip_target_sum = (
+            snap_rows.groupby("slip_target_month")["pipeline_primary"].sum().to_dict()
+        )
+        metrics = {
+            "slippage_months": slip_months,
+            "pipeline_slip_adjusted_primary": slip_target_sum,
+        }
+        for win in [1, 2, 3]:
+            cutoff = snapshot_ts + pd.DateOffset(months=win)
+            due_mask = snap_rows["target_month"] <= cutoff
+            slip_mask = snap_rows["slip_target_month"] <= cutoff
+            metrics[f"pipeline_due_{win}m"] = float(
+                snap_rows.loc[due_mask, "pipeline_primary"].sum()
+            )
+            metrics[f"pipeline_stage_weighted_due_{win}m"] = float(
+                snap_rows.loc[due_mask, "pipeline_stage_weighted_primary"].sum()
+            )
+            metrics[f"pipeline_slip_adjusted_due_{win}m"] = float(
+                snap_rows.loc[slip_mask, "pipeline_primary"].sum()
+            )
+        snapshot_metrics[snapshot_ts] = metrics
+
+    rows = []
+    first_month = all_actual_months.min()
+    for snapshot_ts in snapshot_ts_list:
+        snapshot_for_lags = snapshot_ts - pd.DateOffset(months=1)
+        snap_metrics = snapshot_metrics.get(snapshot_ts, {})
+        slip_primary_map = snap_metrics.get("pipeline_slip_adjusted_primary", {})
+        summary_row = summary_features.get(snapshot_ts, {})
+
+        lag_months = [snapshot_for_lags - pd.DateOffset(months=i) for i in range(0, 12)]
+        lag_values = [
+            np.nan if actuals_lookup.get(m) is None else actuals_lookup.get(m)
+            for m in lag_months
+        ]
+        lag_1 = lag_values[0]
+        lag_2 = lag_values[1] if len(lag_values) > 1 else np.nan
+        lag_3 = lag_values[2] if len(lag_values) > 2 else np.nan
+
+        roll_mean_3 = safe_nanmean(lag_values[:3])
+        roll_mean_6 = safe_nanmean(lag_values[:6])
+        roll_mean_12 = safe_nanmean(lag_values[:12])
+        avg_actuals_12 = roll_mean_12
+
+        summary_primary = (
+            summary_row.get("Sum_Quantity")
+            if feature_mode == "quantity"
+            else summary_row.get("Sum_Total_Price")
+        )
+        summary_primary_coverage = (
+            summary_primary / avg_actuals_12
+            if avg_actuals_12 and not np.isnan(avg_actuals_12)
+            else np.nan
+        )
+        summary_payload = {f"summary_{key}": summary_row.get(key, np.nan) for key in summary_cols}
+
+        trend_idx = month_diff(snapshot_for_lags, first_month)
+
+        try:
+            snap_slice = pipeline_keyed.xs(snapshot_ts, level=0)
+        except KeyError:
+            snap_slice = pd.DataFrame()
+        snap_qty = snap_slice["pipeline_qty"].to_dict() if not snap_slice.empty else {}
+        snap_factored_qty = (
+            snap_slice["pipeline_factored_qty"].to_dict() if not snap_slice.empty else {}
+        )
+        snap_factored_revenue = (
+            snap_slice["pipeline_factored_revenue"].to_dict() if not snap_slice.empty else {}
+        )
+        snap_stage_weighted_qty = (
+            snap_slice["pipeline_stage_weighted_qty"].to_dict() if not snap_slice.empty else {}
+        )
+        snap_stage_weighted_revenue = (
+            snap_slice["pipeline_stage_weighted_revenue"].to_dict() if not snap_slice.empty else {}
+        )
+
+        prior_snapshot = snapshot_ts - pd.DateOffset(months=1)
+        try:
+            prior_slice = pipeline_keyed.xs(prior_snapshot, level=0)
+        except KeyError:
+            prior_slice = pd.DataFrame()
+        prior_factored_qty = (
+            prior_slice["pipeline_factored_qty"].to_dict() if not prior_slice.empty else {}
+        )
+        prior_factored_revenue = (
+            prior_slice["pipeline_factored_revenue"].to_dict() if not prior_slice.empty else {}
+        )
+
+        for target_month in all_actual_months:
+            if target_month < snapshot_ts:
+                continue
+            months_ahead = month_diff(target_month, snapshot_ts)
+            if months_ahead > max_horizon:
+                continue
+
+            pipeline_qty = float(snap_qty.get(target_month, 0.0))
+            pipeline_factored_qty = float(snap_factored_qty.get(target_month, 0.0))
+            pipeline_factored_revenue = float(snap_factored_revenue.get(target_month, 0.0))
+            pipeline_stage_weighted_qty = float(snap_stage_weighted_qty.get(target_month, 0.0))
+            pipeline_stage_weighted_revenue = float(
+                snap_stage_weighted_revenue.get(target_month, 0.0)
+            )
+
+            pipeline_primary = (
+                pipeline_factored_qty if feature_mode == "quantity" else pipeline_factored_revenue
+            )
+            pipeline_stage_weighted_primary = (
+                pipeline_stage_weighted_qty
+                if feature_mode == "quantity"
+                else pipeline_stage_weighted_revenue
+            )
+            prior_primary = float(
+                prior_factored_qty.get(target_month, 0.0)
+                if feature_mode == "quantity"
+                else prior_factored_revenue.get(target_month, 0.0)
+            )
+            delta_pipeline = pipeline_primary - prior_primary
+            pct_delta_pipeline = (
+                delta_pipeline / prior_primary if prior_primary not in (0.0, np.nan) else np.nan
+            )
+            pipeline_coverage = (
+                pipeline_primary / avg_actuals_12
+                if avg_actuals_12 and not np.isnan(avg_actuals_12)
+                else np.nan
+            )
+            target_actual = actuals_series.get(target_month)
+            if pd.isna(target_actual):
+                continue
+
+            rows.append(
+                {
+                    "snapshot_month": snapshot_ts,
+                    "target_month": target_month,
+                    "months_ahead": months_ahead,
+                    "target_month_num": target_month.month,
+                    "lag_1": lag_1,
+                    "lag_2": lag_2,
+                    "lag_3": lag_3,
+                    "roll_mean_3": roll_mean_3,
+                    "roll_mean_6": roll_mean_6,
+                    "roll_mean_12": roll_mean_12,
+                    "trend_idx": trend_idx,
+                    "pipeline_qty": pipeline_qty,
+                    "pipeline_factored_qty": pipeline_factored_qty,
+                    "pipeline_factored_revenue": pipeline_factored_revenue,
+                    "pipeline_stage_weighted_qty": pipeline_stage_weighted_qty,
+                    "pipeline_stage_weighted_revenue": pipeline_stage_weighted_revenue,
+                    "pipeline_primary": pipeline_primary,
+                    "pipeline_stage_weighted_primary": pipeline_stage_weighted_primary,
+                    "prior_pipeline_primary": prior_primary,
+                    "delta_pipeline": delta_pipeline,
+                    "pct_delta_pipeline": pct_delta_pipeline,
+                    "pipeline_coverage": pipeline_coverage,
+                    "pipeline_slip_adjusted_primary": float(
+                        slip_primary_map.get(target_month, 0.0)
+                    ),
+                    "pipeline_due_1m": snap_metrics.get("pipeline_due_1m", np.nan),
+                    "pipeline_due_2m": snap_metrics.get("pipeline_due_2m", np.nan),
+                    "pipeline_due_3m": snap_metrics.get("pipeline_due_3m", np.nan),
+                    "pipeline_stage_weighted_due_1m": snap_metrics.get(
+                        "pipeline_stage_weighted_due_1m", np.nan
+                    ),
+                    "pipeline_stage_weighted_due_2m": snap_metrics.get(
+                        "pipeline_stage_weighted_due_2m", np.nan
+                    ),
+                    "pipeline_stage_weighted_due_3m": snap_metrics.get(
+                        "pipeline_stage_weighted_due_3m", np.nan
+                    ),
+                    "pipeline_slip_adjusted_due_1m": snap_metrics.get(
+                        "pipeline_slip_adjusted_due_1m", np.nan
+                    ),
+                    "pipeline_slip_adjusted_due_2m": snap_metrics.get(
+                        "pipeline_slip_adjusted_due_2m", np.nan
+                    ),
+                    "pipeline_slip_adjusted_due_3m": snap_metrics.get(
+                        "pipeline_slip_adjusted_due_3m", np.nan
+                    ),
+                    "slippage_months": snap_metrics.get("slippage_months", np.nan),
+                    "summary_primary": summary_primary,
+                    "summary_primary_coverage": summary_primary_coverage,
+                    **summary_payload,
+                    "actuals": target_actual,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def build_baseline_features(y: pd.Series) -> pd.DataFrame:
+    y = pd.Series(y).astype(float)
+    features = pd.DataFrame(index=y.index)
+    features["y_lag1"] = y.shift(1)
+    features["y_lag2"] = y.shift(2)
+    features["y_lag3"] = y.shift(3)
+    if len(y.dropna()) >= 24:
+        features["y_lag12"] = y.shift(12)
+    features["month_of_year"] = y.index.month
+    features["trend_index"] = np.arange(len(y))
+    return features
+
+
+def train_baseline_model(actuals_series: pd.Series):
+    features = build_baseline_features(actuals_series)
+    df_ml = pd.concat([features, actuals_series.rename("y")], axis=1).dropna()
+    if len(df_ml) <= 5:
+        raise RuntimeError("Insufficient rows for baseline ML training.")
+
+    model = GradientBoostingRegressor(random_state=42)
+    model.fit(df_ml.drop(columns=["y"]), df_ml["y"])
+    preds = pd.Series(model.predict(df_ml.drop(columns=["y"])), index=df_ml.index)
+    feature_columns = list(df_ml.drop(columns=["y"]).columns)
+    return model, feature_columns, preds
+
+
+def forecast_baseline_recursive(
+    model: GradientBoostingRegressor,
+    y_history: List[float],
+    last_date: pd.Timestamp,
+    horizon: int,
+    feature_columns: List[str],
+) -> pd.Series:
+    preds = []
+    history = list(y_history)
+    start_trend = len(history)
+    include_lag12 = "y_lag12" in feature_columns
+
+    for step in range(1, horizon + 1):
+        future_date = last_date + pd.DateOffset(months=step)
+        if len(history) < 3 or (include_lag12 and len(history) < 12):
+            raise RuntimeError("Insufficient history for baseline recursive forecast.")
+
+        row = {
+            "y_lag1": history[-1],
+            "y_lag2": history[-2],
+            "y_lag3": history[-3],
+            "month_of_year": future_date.month,
+            "trend_index": start_trend + (step - 1),
+        }
+        if include_lag12:
+            row["y_lag12"] = history[-12]
+
+        X_next = pd.DataFrame([row])[feature_columns]
+        y_next = float(model.predict(X_next)[0])
+        preds.append(y_next)
+        history.append(y_next)
+
+    index = pd.date_range(start=last_date + pd.DateOffset(months=1), periods=horizon, freq="MS")
+    return pd.Series(preds, index=index)
+
+
+def baseline_forecast_for_snapshot(
+    actuals_series: pd.Series,
+    snapshot_month: pd.Timestamp,
+    horizon: int,
+) -> Optional[pd.Series]:
+    snapshot_ts = pd.Timestamp(snapshot_month)
+    cutoff = snapshot_ts - pd.DateOffset(months=1)
+    history = actuals_series[actuals_series.index <= cutoff].dropna()
+    if history.empty or horizon <= 0:
+        return None
+    try:
+        model, feature_cols, _ = train_baseline_model(history)
+    except RuntimeError:
+        return None
+    try:
+        forecast = forecast_baseline_recursive(
+            model=model,
+            y_history=list(history.values),
+            last_date=history.index.max(),
+            horizon=horizon,
+            feature_columns=feature_cols,
+        )
+    except RuntimeError:
+        return None
+    return forecast
+
+
+def train_models(df: pd.DataFrame) -> ModelBundle:
+    adjustment_features = [
+        "months_ahead",
+        "target_month_num",
+        "pipeline_primary",
+        "pipeline_stage_weighted_primary",
+        "delta_pipeline",
+        "pct_delta_pipeline",
+        "pipeline_coverage",
+        "pipeline_slip_adjusted_primary",
+        "pipeline_due_1m",
+        "pipeline_due_2m",
+        "pipeline_due_3m",
+        "pipeline_stage_weighted_due_1m",
+        "pipeline_stage_weighted_due_2m",
+        "pipeline_stage_weighted_due_3m",
+        "pipeline_slip_adjusted_due_1m",
+        "pipeline_slip_adjusted_due_2m",
+        "pipeline_slip_adjusted_due_3m",
+        "slippage_months",
+        "baseline_pred",
+    ]
+    summary_feature_prefix = "summary_"
+    summary_cols = [col for col in df.columns if col.startswith(summary_feature_prefix)]
+    candidate_summary = ["summary_primary", "summary_primary_coverage"] + summary_cols
+    summary_available = [col for col in candidate_summary if df[col].notna().any()]
+    adjustment_features.extend(summary_available)
+
+    df = df.copy()
+    df = df.dropna(subset=["actuals", "baseline_pred"])
+    df["residual"] = df["actuals"] - df["baseline_pred"]
+
+    adjustment_model = None
+    if df[adjustment_features].notna().any().any():
+        adjustment_model = Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                (
+                    "model",
+                    GradientBoostingRegressor(
+                        n_estimators=250,
+                        learning_rate=0.05,
+                        max_depth=3,
+                        random_state=42,
+                    ),
+                ),
+            ]
+        )
+        adjustment_model.fit(df[adjustment_features], df["residual"])
+
+    return ModelBundle(
+        adjustment_model=adjustment_model,
+        adjustment_features=adjustment_features,
+    )
+
+
+def predict_with_models(df: pd.DataFrame, bundle: ModelBundle) -> pd.DataFrame:
+    output = df.copy()
+
+    if bundle.adjustment_model is not None:
+        output["adjustment_pred"] = bundle.adjustment_model.predict(
+            output[bundle.adjustment_features]
+        )
+    else:
+        output["adjustment_pred"] = 0.0
+
+    output["final_pred"] = output["baseline_pred"] + output["adjustment_pred"]
+    output["final_pred"] = output["final_pred"].clip(lower=0.0)
+    return output
+
+
+def build_future_frame(
+    actuals: pd.DataFrame,
+    pipeline_history: pd.DataFrame,
+    feature_mode: str,
+    summary_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    actuals_series = actuals.set_index("Month")["Actuals"].sort_index()
+    last_actual_month = actuals_series.index.max()
+    if pipeline_history.empty:
+        return pd.DataFrame()
+
+    snapshot_month = pd.Timestamp(pipeline_history["snapshot_month"].max())
+    current_pipeline = pipeline_history[
+        pipeline_history["snapshot_month"] == snapshot_month
+    ].copy()
+    if current_pipeline.empty:
+        return pd.DataFrame()
+    snapshot_for_lags = min(snapshot_month - pd.DateOffset(months=1), last_actual_month)
+
+    summary_row = {}
+    summary_cols = []
+    if summary_df is not None and not summary_df.empty:
+        summary_cols = [c for c in summary_df.columns if c not in {"Month", "group_key", "BU"}]
+        summary_row = (
+            summary_df[summary_df["Month"] == snapshot_month].iloc[0].to_dict()
+            if (summary_df["Month"] == snapshot_month).any()
+            else {}
+        )
+    summary_payload = {f"summary_{col}": summary_row.get(col, np.nan) for col in summary_cols}
+
+    if feature_mode == "quantity":
+        current_pipeline["pipeline_primary"] = current_pipeline["pipeline_factored_qty"]
+        current_pipeline["pipeline_stage_weighted_primary"] = current_pipeline[
+            "pipeline_stage_weighted_qty"
+        ]
+    else:
+        current_pipeline["pipeline_primary"] = current_pipeline["pipeline_factored_revenue"]
+        current_pipeline["pipeline_stage_weighted_primary"] = current_pipeline[
+            "pipeline_stage_weighted_revenue"
+        ]
+
+    slip_months = current_pipeline["slippage_months"].median()
+    slip_months = int(round(slip_months)) if pd.notna(slip_months) else 0
+    if slip_months:
+        current_pipeline["slip_target_month"] = current_pipeline["target_month"] + pd.DateOffset(
+            months=slip_months
+        )
+    else:
+        current_pipeline["slip_target_month"] = current_pipeline["target_month"]
+
+    pipeline_keyed = current_pipeline.set_index(["snapshot_month", "target_month"])
+    pipeline_keyed_full = pipeline_history.set_index(["snapshot_month", "target_month"])
+
+    slip_target_sum = (
+        current_pipeline.groupby("slip_target_month")["pipeline_primary"].sum().to_dict()
+    )
+
+    snapshot_metrics = {}
+    for win in [1, 2, 3]:
+        cutoff = snapshot_month + pd.DateOffset(months=win)
+        due_mask = current_pipeline["target_month"] <= cutoff
+        slip_mask = current_pipeline["slip_target_month"] <= cutoff
+        snapshot_metrics[f"pipeline_due_{win}m"] = float(
+            current_pipeline.loc[due_mask, "pipeline_primary"].sum()
+        )
+        snapshot_metrics[f"pipeline_stage_weighted_due_{win}m"] = float(
+            current_pipeline.loc[due_mask, "pipeline_stage_weighted_primary"].sum()
+        )
+        snapshot_metrics[f"pipeline_slip_adjusted_due_{win}m"] = float(
+            current_pipeline.loc[slip_mask, "pipeline_primary"].sum()
+        )
+
+    lag_months = [snapshot_for_lags - pd.DateOffset(months=i) for i in range(0, 12)]
+    lag_values = [
+        np.nan if actuals_series.get(m) is None else actuals_series.get(m) for m in lag_months
+    ]
+    lag_1 = lag_values[0]
+    lag_2 = lag_values[1] if len(lag_values) > 1 else np.nan
+    lag_3 = lag_values[2] if len(lag_values) > 2 else np.nan
+
+    roll_mean_3 = safe_nanmean(lag_values[:3])
+    roll_mean_6 = safe_nanmean(lag_values[:6])
+    roll_mean_12 = safe_nanmean(lag_values[:12])
+    avg_actuals_12 = roll_mean_12
+
+    summary_primary = (
+        summary_row.get("Sum_Quantity")
+        if feature_mode == "quantity"
+        else summary_row.get("Sum_Total_Price")
+    )
+    summary_primary_coverage = (
+        summary_primary / avg_actuals_12
+        if avg_actuals_12 and not np.isnan(avg_actuals_12)
+        else np.nan
+    )
+
+    rows = []
+    for i in range(1, FORECAST_HORIZON + 1):
+        target_month = last_actual_month + pd.DateOffset(months=i)
+        months_ahead = month_diff(target_month, snapshot_month)
+
+        key = (snapshot_month, target_month)
+        pipeline_row = pipeline_keyed.loc[key] if key in pipeline_keyed.index else None
+        pipeline_qty = float(pipeline_row["pipeline_qty"]) if pipeline_row is not None else 0.0
+        pipeline_factored_qty = (
+            float(pipeline_row["pipeline_factored_qty"]) if pipeline_row is not None else 0.0
+        )
+        pipeline_factored_revenue = (
+            float(pipeline_row["pipeline_factored_revenue"]) if pipeline_row is not None else 0.0
+        )
+        pipeline_stage_weighted_qty = (
+            float(pipeline_row["pipeline_stage_weighted_qty"])
+            if pipeline_row is not None
+            else 0.0
+        )
+        pipeline_stage_weighted_revenue = (
+            float(pipeline_row["pipeline_stage_weighted_revenue"])
+            if pipeline_row is not None
+            else 0.0
+        )
+
+        pipeline_primary = (
+            pipeline_factored_qty if feature_mode == "quantity" else pipeline_factored_revenue
+        )
+        pipeline_stage_weighted_primary = (
+            pipeline_stage_weighted_qty
+            if feature_mode == "quantity"
+            else pipeline_stage_weighted_revenue
+        )
+        prior_snapshot = snapshot_month - pd.DateOffset(months=1)
+        prior_row = (
+            pipeline_keyed_full.loc[(prior_snapshot, target_month)]
+            if (prior_snapshot, target_month) in pipeline_keyed_full.index
+            else None
+        )
+        prior_primary = (
+            float(
+                prior_row["pipeline_factored_qty"]
+                if feature_mode == "quantity"
+                else prior_row["pipeline_factored_revenue"]
+            )
+            if prior_row is not None
+            else 0.0
+        )
+        delta_pipeline = pipeline_primary - prior_primary
+        pct_delta_pipeline = (
+            delta_pipeline / prior_primary if prior_primary not in (0.0, np.nan) else np.nan
+        )
+        pipeline_coverage = (
+            pipeline_primary / avg_actuals_12
+            if avg_actuals_12 and not np.isnan(avg_actuals_12)
+            else np.nan
+        )
+
+        trend_idx = month_diff(snapshot_for_lags, actuals_series.index.min())
+
+        rows.append(
+            {
+                "snapshot_month": snapshot_month,
+                "target_month": target_month,
+                "months_ahead": months_ahead,
+                "target_month_num": target_month.month,
+                "lag_1": lag_1,
+                "lag_2": lag_2,
+                "lag_3": lag_3,
+                "roll_mean_3": roll_mean_3,
+                "roll_mean_6": roll_mean_6,
+                "roll_mean_12": roll_mean_12,
+                "trend_idx": trend_idx,
+                "pipeline_qty": pipeline_qty,
+                "pipeline_factored_qty": pipeline_factored_qty,
+                "pipeline_factored_revenue": pipeline_factored_revenue,
+                "pipeline_stage_weighted_qty": pipeline_stage_weighted_qty,
+                "pipeline_stage_weighted_revenue": pipeline_stage_weighted_revenue,
+                "pipeline_primary": pipeline_primary,
+                "pipeline_stage_weighted_primary": pipeline_stage_weighted_primary,
+                "prior_pipeline_primary": prior_primary,
+                "delta_pipeline": delta_pipeline,
+                "pct_delta_pipeline": pct_delta_pipeline,
+                "pipeline_coverage": pipeline_coverage,
+                "pipeline_slip_adjusted_primary": float(slip_target_sum.get(target_month, 0.0)),
+                "pipeline_due_1m": snapshot_metrics.get("pipeline_due_1m", np.nan),
+                "pipeline_due_2m": snapshot_metrics.get("pipeline_due_2m", np.nan),
+                "pipeline_due_3m": snapshot_metrics.get("pipeline_due_3m", np.nan),
+                "pipeline_stage_weighted_due_1m": snapshot_metrics.get(
+                    "pipeline_stage_weighted_due_1m", np.nan
+                ),
+                "pipeline_stage_weighted_due_2m": snapshot_metrics.get(
+                    "pipeline_stage_weighted_due_2m", np.nan
+                ),
+                "pipeline_stage_weighted_due_3m": snapshot_metrics.get(
+                    "pipeline_stage_weighted_due_3m", np.nan
+                ),
+                "pipeline_slip_adjusted_due_1m": snapshot_metrics.get(
+                    "pipeline_slip_adjusted_due_1m", np.nan
+                ),
+                "pipeline_slip_adjusted_due_2m": snapshot_metrics.get(
+                    "pipeline_slip_adjusted_due_2m", np.nan
+                ),
+                "pipeline_slip_adjusted_due_3m": snapshot_metrics.get(
+                    "pipeline_slip_adjusted_due_3m", np.nan
+                ),
+                "slippage_months": slip_months,
+                "summary_primary": summary_primary,
+                "summary_primary_coverage": summary_primary_coverage,
+                **summary_payload,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def merge_summary_regressors(df_all: pd.DataFrame, summary_full: pd.DataFrame) -> pd.DataFrame:
+    if summary_full.empty:
+        return df_all
+
+    summary = summary_full.copy()
+    summary["Product_norm"] = summary["group_key"].apply(normalize_code)
+    summary["Division_str"] = summary["BU"].astype(str)
+    summary = summary.rename(columns={"Month": COL_DATE})
+
+    summary_cols = [
+        col
+        for col in summary.columns
+        if col not in {"group_key", "BU", "Product_norm", "Division_str", COL_DATE}
+    ]
+    merge_cols = ["Product_norm", "Division_str", COL_DATE] + summary_cols
+    summary = summary[merge_cols]
+
+    df_all = df_all.copy()
+    df_all["Product_norm"] = df_all[COL_PRODUCT].apply(normalize_code)
+    df_all["Division_str"] = df_all[COL_DIVISION].astype(str)
+    df_all = df_all.merge(
+        summary,
+        on=["Product_norm", "Division_str", COL_DATE],
+        how="left",
+        suffixes=("", "_summary"),
+    )
+
+    for col in summary_cols:
+        summary_col = f"{col}_summary"
+        if summary_col in df_all.columns:
+            df_all[col] = df_all[summary_col]
+            df_all = df_all.drop(columns=[summary_col])
+
+    df_all = df_all.drop(columns=["Product_norm", "Division_str"], errors="ignore")
+    return df_all
 def _friendly_regressor_name(reg_name: Optional[str]) -> str:
     """Return a natural-language regressor name."""
     if reg_name is None:
@@ -217,6 +1207,8 @@ def _model_group_from_choice(choice: dict) -> Optional[str]:
         return "with_regressor"
     if model_name == "ML_GBR":
         return "ml_gbr"
+    if model_name == PIPELINE_ML_MODEL_NAME:
+        return "ml_gbr_pipeline"
     if model_name == "PROPHET":
         return "prophet"
     return None
@@ -238,32 +1230,52 @@ def _apply_recommended_model_flags(
         priority.append(preferred_group)
     priority.extend(
         g
-        for g in ["baseline_sarima", "with_regressor", "baseline_ets", "ml_gbr", "prophet"]
+        for g in [
+            "baseline_sarima",
+            "with_regressor",
+            "baseline_ets",
+            "ml_gbr_pipeline",
+            "ml_gbr",
+            "prophet",
+        ]
         if g not in priority
     )
 
-    for month, group in fc_df.groupby("forecast_month"):
-        chosen_group = None
-        for model_group in priority:
-            ok_rows = group[
-                (group["model_group"] == model_group) & (group["model_status"] == "ok")
-            ]
-            if not ok_rows.empty:
-                chosen_group = model_group
-                break
+    chosen_group = None
+    for model_group in priority:
+        ok_rows = fc_df[
+            (fc_df["model_group"] == model_group) & (fc_df["model_status"] == "ok")
+        ]
+        if not ok_rows.empty:
+            chosen_group = model_group
+            break
 
-        if chosen_group is None:
-            ok_any = group[group["model_status"] == "ok"]
-            if not ok_any.empty:
-                chosen_group = ok_any.iloc[0]["model_group"]
+    if chosen_group is None:
+        ok_any = fc_df[fc_df["model_status"] == "ok"]
+        if not ok_any.empty:
+            chosen_group = ok_any.iloc[0]["model_group"]
 
-        if chosen_group is not None:
-            idx = group[
-                (group["model_group"] == chosen_group) & (group["model_status"] == "ok")
-            ].index
-            fc_df.loc[idx, "recommended_model"] = True
+    if chosen_group is not None:
+        idx = fc_df[
+            (fc_df["model_group"] == chosen_group) & (fc_df["model_status"] == "ok")
+        ].index
+        fc_df.loc[idx, "recommended_model"] = True
 
     return fc_df
+
+
+def _apply_recommended_flags_all(
+    all_forecasts: pd.DataFrame,
+    model_choices: Dict[Tuple[str, str], dict],
+) -> pd.DataFrame:
+    all_forecasts = all_forecasts.copy()
+    all_forecasts["recommended_model"] = False
+    for (prod, div), idx in all_forecasts.groupby(["product_id", "bu_id"]).groups.items():
+        choice = model_choices.get((prod, div))
+        preferred_group = _model_group_from_choice(choice)
+        flagged = _apply_recommended_model_flags(all_forecasts.loc[idx], preferred_group)
+        all_forecasts.loc[idx, "recommended_model"] = flagged["recommended_model"].values
+    return all_forecasts
 
 
 def _parse_order_cell(value, expected_len: int) -> Optional[Tuple[int, ...]]:
@@ -1092,8 +2104,6 @@ def _safe_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 def _compute_test_window(history_months: int) -> int:
     """Compute test window length based on history length."""
-    if history_months < 24:
-        return min(TEST_HORIZON_DEFAULT, max(MIN_TEST_WINDOW, int(np.floor(0.25 * history_months))))
     return TEST_HORIZON_DEFAULT
 
 
@@ -1356,6 +2366,10 @@ def generate_forecast_variants(
     exog_series: Optional[pd.Series] = None,
     regressor_name: Optional[str] = None,
     regressor_lag: Optional[int] = None,
+    pipeline_history: Optional[pd.DataFrame] = None,
+    feature_mode: Optional[str] = None,
+    summary_df: Optional[pd.DataFrame] = None,
+    use_pipeline_ml: bool = False,
     allow_sarima: bool = True,
     allow_sarimax: bool = True,
     allow_ets: bool = True,
@@ -1563,52 +2577,145 @@ def generate_forecast_variants(
 
     # ML challenger (GradientBoostingRegressor)
     if allow_ml:
-        try:
-            y_train = y.dropna()
-            features = _build_ml_features(y_train)
-            df_ml = pd.concat([features, y_train.rename("y")], axis=1).dropna()
-            if len(df_ml) <= 5:
-                raise ValueError("Insufficient ML rows after dropping NaNs.")
+        if use_pipeline_ml:
+            try:
+                actuals_df = y.reset_index()
+                actuals_df = actuals_df.rename(columns={COL_DATE: "Month", COL_ACTUALS: "Actuals"})
+                actuals_df["Month"] = month_start(actuals_df["Month"])
+                actuals_series = actuals_df.set_index("Month")["Actuals"].sort_index()
 
-            model = GradientBoostingRegressor(random_state=42)
-            model.fit(df_ml.drop(columns=["y"]), df_ml["y"])
-            feature_columns = list(df_ml.drop(columns=["y"]).columns)
-            y_history = list(y_train.values)
-            mean = _forecast_ml_recursive(
-                model=model,
-                y_history=y_history,
-                last_date=y_train.index.max(),
-                horizon=len(forecast_index),
-                feature_columns=feature_columns,
-            )
-            ml_df = pd.DataFrame({
-                "forecast_month": forecast_index,
-                "forecast_value": mean.values,
-                "lower_ci": [np.nan] * len(forecast_index),
-                "upper_ci": [np.nan] * len(forecast_index),
-                "model_group": "ml_gbr",
-                "model_type": "ML",
-                "model_label": _natural_model_label("ml_gbr"),
-                "p": np.nan,
-                "d": np.nan,
-                "q": np.nan,
-                "P": np.nan,
-                "D": np.nan,
-                "Q": np.nan,
-                "s": np.nan,
-                "regressor_names": None,
-                "regressor_details": None,
-            })
-            dfs.append(_attach_status(_apply_forecast_floor(ml_df), "ok"))
-        except Exception as exc:
-            reason = status_reasons.get("ml_gbr", f"Failed: {exc}")
-            dfs.append(_build_na_rows(
-                "ml_gbr",
-                "ML",
-                _natural_model_label("ml_gbr"),
-                reason,
-                status="Failed",
-            ))
+                training = build_feature_frame(
+                    actuals_df,
+                    pipeline_history if pipeline_history is not None else pd.DataFrame(),
+                    FORECAST_HORIZON,
+                    feature_mode or "quantity",
+                    summary_df=summary_df,
+                )
+                if training.empty:
+                    raise ValueError("No training rows after assembling pipeline features.")
+
+                training["baseline_pred"] = np.nan
+                for snapshot in sorted(training["snapshot_month"].dropna().unique()):
+                    snapshot_rows = training["snapshot_month"] == snapshot
+                    horizon = int(training.loc[snapshot_rows, "months_ahead"].max())
+                    forecast = baseline_forecast_for_snapshot(actuals_series, snapshot, horizon)
+                    if forecast is None:
+                        continue
+                    training.loc[snapshot_rows, "baseline_pred"] = training.loc[
+                        snapshot_rows, "target_month"
+                    ].map(forecast)
+                training = training.dropna(subset=["baseline_pred"])
+                if training.empty:
+                    raise ValueError("No baseline predictions available for pipeline training.")
+
+                future_frame = build_future_frame(
+                    actuals_df,
+                    pipeline_history if pipeline_history is not None else pd.DataFrame(),
+                    feature_mode or "quantity",
+                    summary_df=summary_df,
+                )
+                if future_frame.empty:
+                    raise ValueError("No future rows after assembling pipeline features.")
+
+                snapshot_month = pd.Timestamp(
+                    pipeline_history["snapshot_month"].max()
+                ) if pipeline_history is not None and not pipeline_history.empty else None
+                if snapshot_month is None:
+                    raise ValueError("No snapshot month available for pipeline forecast.")
+
+                baseline_future = baseline_forecast_for_snapshot(
+                    actuals_series=actuals_series,
+                    snapshot_month=snapshot_month,
+                    horizon=FORECAST_HORIZON,
+                )
+                if baseline_future is None:
+                    raise ValueError("Baseline forecast unavailable for pipeline ML.")
+
+                future_frame["baseline_pred"] = future_frame["target_month"].map(baseline_future)
+                future_frame = future_frame.dropna(subset=["baseline_pred"])
+                if future_frame.empty:
+                    raise ValueError("No baseline predictions for future pipeline frame.")
+
+                bundle = train_models(training)
+                future_pred = predict_with_models(future_frame, bundle)
+                future_pred = future_pred.set_index("target_month").sort_index()
+                mean = future_pred.reindex(forecast_index)["final_pred"]
+
+                ml_df = pd.DataFrame({
+                    "forecast_month": forecast_index,
+                    "forecast_value": mean.values,
+                    "lower_ci": [np.nan] * len(forecast_index),
+                    "upper_ci": [np.nan] * len(forecast_index),
+                    "model_group": "ml_gbr_pipeline",
+                    "model_type": "ML",
+                    "model_label": _natural_model_label("ml_gbr_pipeline"),
+                    "p": np.nan,
+                    "d": np.nan,
+                    "q": np.nan,
+                    "P": np.nan,
+                    "D": np.nan,
+                    "Q": np.nan,
+                    "s": np.nan,
+                    "regressor_names": None,
+                    "regressor_details": None,
+                })
+                dfs.append(_attach_status(_apply_forecast_floor(ml_df), "ok"))
+            except Exception as exc:
+                reason = status_reasons.get("ml_gbr_pipeline", f"Failed: {exc}")
+                dfs.append(_build_na_rows(
+                    "ml_gbr_pipeline",
+                    "ML",
+                    _natural_model_label("ml_gbr_pipeline"),
+                    reason,
+                    status="Failed",
+                ))
+        else:
+            try:
+                y_train = y.dropna()
+                features = _build_ml_features(y_train)
+                df_ml = pd.concat([features, y_train.rename("y")], axis=1).dropna()
+                if len(df_ml) <= 5:
+                    raise ValueError("Insufficient ML rows after dropping NaNs.")
+
+                model = GradientBoostingRegressor(random_state=42)
+                model.fit(df_ml.drop(columns=["y"]), df_ml["y"])
+                feature_columns = list(df_ml.drop(columns=["y"]).columns)
+                y_history = list(y_train.values)
+                mean = _forecast_ml_recursive(
+                    model=model,
+                    y_history=y_history,
+                    last_date=y_train.index.max(),
+                    horizon=len(forecast_index),
+                    feature_columns=feature_columns,
+                )
+                ml_df = pd.DataFrame({
+                    "forecast_month": forecast_index,
+                    "forecast_value": mean.values,
+                    "lower_ci": [np.nan] * len(forecast_index),
+                    "upper_ci": [np.nan] * len(forecast_index),
+                    "model_group": "ml_gbr",
+                    "model_type": "ML",
+                    "model_label": _natural_model_label("ml_gbr"),
+                    "p": np.nan,
+                    "d": np.nan,
+                    "q": np.nan,
+                    "P": np.nan,
+                    "D": np.nan,
+                    "Q": np.nan,
+                    "s": np.nan,
+                    "regressor_names": None,
+                    "regressor_details": None,
+                })
+                dfs.append(_attach_status(_apply_forecast_floor(ml_df), "ok"))
+            except Exception as exc:
+                reason = status_reasons.get("ml_gbr", f"Failed: {exc}")
+                dfs.append(_build_na_rows(
+                    "ml_gbr",
+                    "ML",
+                    _natural_model_label("ml_gbr"),
+                    reason,
+                    status="Failed",
+                ))
 
     # Prophet challenger
     if allow_prophet:
@@ -1732,8 +2839,76 @@ def main():
         output_excel_path=REVISED_ACTUALS_FILE,
         output_sheet=REVISED_ACTUALS_SHEET,
     )
+    summary_full = pd.DataFrame()
+    if SUMMARY_PATH.exists():
+        summary_full = load_summary_report(SUMMARY_PATH)
+    else:
+        print(f"[WARN] Summary file not found: {SUMMARY_PATH}")
+    df_all = merge_summary_regressors(df_all, summary_full)
     df_all[COL_DATE] = pd.to_datetime(df_all[COL_DATE])
     df_all = df_all.sort_values([COL_PRODUCT, COL_DIVISION, COL_DATE])
+
+    catalog = pd.read_excel(PRODUCT_CATALOG_PATH)
+    if "group_key" in catalog.columns:
+        catalog["group_key_norm"] = catalog["group_key"].apply(normalize_code)
+    if "business_unit_code" in catalog.columns:
+        catalog["business_unit_code_str"] = catalog["business_unit_code"].astype(str)
+
+    pipeline_all = pd.DataFrame()
+    if PIPELINE_FILES:
+        pipeline_frames = []
+        for path in PIPELINE_FILES:
+            df = pd.read_excel(path)
+            df["_source_file"] = path.name
+            pipeline_frames.append(df)
+        pipeline_all = pd.concat(pipeline_frames, ignore_index=True)
+    if not pipeline_all.empty:
+        if "Month" in pipeline_all.columns and "snapshot_month" not in pipeline_all.columns:
+            pipeline_all["snapshot_month"] = parse_snapshot_month(pipeline_all["Month"])
+        if "Close Date" in pipeline_all.columns and "target_month" not in pipeline_all.columns:
+            pipeline_all["target_month"] = parse_close_date(pipeline_all["Close Date"])
+        numeric_cols = [
+            "Quantity",
+            "Quantity W/ Decimal",
+            "Probability",
+            "Total Price",
+            "Factored Quantity",
+            "Factored Revenue",
+        ]
+        for col in numeric_cols:
+            if col in pipeline_all.columns:
+                pipeline_all[col] = pd.to_numeric(pipeline_all[col], errors="coerce")
+        if "Product Code" in pipeline_all.columns:
+            pipeline_all["Product_Code_num"] = pd.to_numeric(
+                pipeline_all["Product Code"], errors="coerce"
+            )
+            pipeline_all["Product_Code_norm"] = pipeline_all["Product Code"].apply(
+                normalize_code
+            )
+        if "Current OSC Product Name" in pipeline_all.columns:
+            pipeline_all["Current_OSC_Product_Name_norm"] = pipeline_all[
+                "Current OSC Product Name"
+            ].apply(normalize_code)
+    pipeline_preprocessed = (
+        not pipeline_all.empty
+        and "snapshot_month" in pipeline_all.columns
+        and "target_month" in pipeline_all.columns
+    )
+
+    sf_reference = load_sf_product_reference()
+    sf_code_map: Dict[Tuple[str, str], List[str]] = {}
+    if not sf_reference.empty:
+        sf_reference = sf_reference.copy()
+        sf_reference["salesforce_product_name"] = sf_reference[
+            "salesforce_product_name"
+        ].astype(str)
+        grouped = sf_reference.groupby(["group_key", "business_unit_code"])
+        sf_code_map = {
+            (normalize_code(group_key), str(div)): list(
+                group["salesforce_product_name"].unique()
+            )
+            for (group_key, div), group in grouped
+        }
 
     print("Loading chosen models...")
     model_choices = load_model_choices(SUMMARY_FILE)
@@ -1759,6 +2934,26 @@ def main():
 
         order, seasonal_order = order_pair
         df_sku = df_sku.set_index(COL_DATE)
+        summary_product = filter_summary_product(summary_full, prod, div)
+        feature_mode = None
+        pipeline_history = pd.DataFrame()
+        pipeline_reason = ""
+        if ENABLE_ML_CHALLENGER:
+            try:
+                feature_mode = load_feature_mode(prod, str(div), catalog=catalog)
+            except RuntimeError as exc:
+                pipeline_reason = str(exc)
+            sf_codes = sf_code_map.get((normalize_code(prod), str(div)), [])
+            if not pipeline_all.empty:
+                pipeline_history = load_pipeline_history(
+                    prod,
+                    str(div),
+                    sf_codes=sf_codes,
+                    pipeline_all=pipeline_all,
+                    pipeline_preprocessed=pipeline_preprocessed,
+                )
+            else:
+                pipeline_reason = pipeline_reason or "No pipeline files available."
         df_features = engineer_regressors(df_sku)
 
         y = df_features[COL_ACTUALS].astype(float)
@@ -1810,8 +3005,21 @@ def main():
             status_reasons["with_regressor"] = "N/A: no regressor selected or exog unavailable."
 
         allow_ml = ENABLE_ML_CHALLENGER
+        use_pipeline_ml = False
         if not allow_ml:
             status_reasons["ml_gbr"] = "N/A: ML challenger disabled."
+            status_reasons["ml_gbr_pipeline"] = "N/A: ML challenger disabled."
+        else:
+            if summary_product.empty and not pipeline_reason:
+                pipeline_reason = "No summary data for product/BU."
+            if pipeline_history.empty and not pipeline_reason:
+                pipeline_reason = "No pipeline history rows."
+            if pipeline_reason:
+                status_reasons["ml_gbr_pipeline"] = pipeline_reason
+            if feature_mode is not None and not pipeline_reason:
+                use_pipeline_ml = True
+            else:
+                status_reasons.setdefault("ml_gbr", "Using legacy ML (no pipeline data).")
 
         allow_prophet = ENABLE_PROPHET_CHALLENGER and PROPHET_AVAILABLE
         if not ENABLE_PROPHET_CHALLENGER:
@@ -1829,6 +3037,10 @@ def main():
             exog_series=exog_series,
             regressor_name=reg_name,
             regressor_lag=reg_lag,
+            pipeline_history=pipeline_history,
+            feature_mode=feature_mode,
+            summary_df=summary_product,
+            use_pipeline_ml=use_pipeline_ml,
             allow_sarima=allow_sarima,
             allow_sarimax=allow_sarimax,
             allow_ets=allow_ets,
@@ -1852,6 +3064,7 @@ def main():
         return
 
     all_forecasts = pd.concat(results_rows, axis=0, ignore_index=True)
+    all_forecasts = _apply_recommended_flags_all(all_forecasts, model_choices)
     # Format forecast_month for Excel as MM/DD/YYYY to avoid time components
     all_forecasts["forecast_month"] = pd.to_datetime(all_forecasts["forecast_month"]).dt.strftime("%m/%d/%Y")
 

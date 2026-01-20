@@ -7,15 +7,23 @@ Python scripts for selecting SARIMA/SARIMAX orders by SKU, evaluating exogenous 
 - `sarima_multi_sku_engine.py` - uses the chosen orders to compare baseline SARIMA/ETS vs. SARIMAX models with lagged regressors; writes `sarima_multi_sku_summary.xlsx`.
 - `sarima_forecast.py` - builds forecast variants (baseline SARIMA/ETS and SARIMAX if allowed) for each SKU; writes `stats_model_forecasts_YYYY-Mon.xlsx`.
 - `generate_forecast_variants.py` - small utility showing how to assemble forecast variants for a given SKU (used as a reference/helper).
+- `compare_model_selection.py` - optional report comparing legacy vs. current selection logic (bias override impacts).
 - `.gitignore` - excludes data files (`*.xlsx`, `*.csv`) and Python build artifacts.
 
 ## Expected inputs (not committed)
 Place these Excel files in the project root before running:
-- `all_products_with_sf_and_bookings.xlsx` - historical monthly actuals and exogenous signals per Product/Division.
+- `all_products_actuals_and_bookings.xlsx` - historical monthly actuals and exogenous signals per Product/Division.
 - `sarimax_order_search_summary.xlsx` - produced by `sarima_order_selector.py`.
 - `sarima_multi_sku_summary.xlsx` - produced by `sarima_multi_sku_engine.py`.
+If you are sourcing from the raw Essbase exports, generate the combined actuals/bookings file with:
+```bash
+python build_actuals_bookings_from_raw.py
+```
+Additional Salesforce inputs (stored in `salesforce_data/`):
+- `Salesforce Pipeline Monthly Summary.xlsx` - monthly Salesforce summary metrics by `group_key` and `BU` (now the source for SARIMAX regressors and pipeline ML features).
+- `Merged Salesforce Pipeline *.xlsx` - historical pipeline snapshots used by the pipeline GB model.
 
-Minimum required columns in `all_products_with_sf_and_bookings.xlsx`:
+Minimum required columns in `all_products_actuals_and_bookings.xlsx`:
 - `Product` - SKU or product identifier.
 - `Division` - business unit or division key.
 - `Month` - monthly date; treated as month-start timestamps.
@@ -38,21 +46,22 @@ pip install -r requirements.txt
 ```bash
 python sarima_order_selector.py
 ```
-   - Reads `all_products_with_sf_and_bookings.xlsx`
+   - Reads `all_products_actuals_and_bookings.xlsx`
    - Outputs `sarimax_order_search_summary.xlsx`
 
 2) Evaluate regressors and pick a model per SKU:
 ```bash
 python sarima_multi_sku_engine.py
 ```
-   - Reads `all_products_with_sf_and_bookings.xlsx` and `sarimax_order_search_summary.xlsx`
+   - Reads `all_products_actuals_and_bookings.xlsx` and `sarimax_order_search_summary.xlsx`
    - Outputs `sarima_multi_sku_summary.xlsx`
+   - Optional: add `--compare-model-selection` to generate old vs. new selection comparison CSVs in `data_storage/model_selection_eval/`
 
 3) Generate forecast variants:
 ```bash
 python sarima_forecast.py
 ```
-   - Reads `all_products_with_sf_and_bookings.xlsx`, `sarimax_order_search_summary.xlsx`, and `sarima_multi_sku_summary.xlsx`
+   - Reads `all_products_actuals_and_bookings.xlsx`, `sarimax_order_search_summary.xlsx`, and `sarima_multi_sku_summary.xlsx`
    - Outputs `stats_model_forecasts_YYYY-Mon.xlsx` with a password of "gopackgo"
 
 ## Model logic and assumptions (new analyst guide)
@@ -62,8 +71,9 @@ This section explains how each script makes decisions, along with thresholds, as
 ### Shared data handling
 - Duplicate Product/Division/Month rows are collapsed by summing additive series (Actuals, Bookings) and keeping the first value for other fields.
 - Month fields are coerced to datetime and treated as month-start dates.
-- Pre-launch zeros in `Actuals` are treated as missing: for each Product/Division, any zero before the first positive actual is replaced with NaN. A revised file `all_products_with_sf_and_bookings_revised.xlsx` is written by the engine/forecast scripts.
+- Pre-launch zeros in `Actuals` are treated as missing: for each Product/Division, any zero before the first positive actual is replaced with NaN. A revised file `all_products_actuals_and_bookings_revised.xlsx` is written by the engine/forecast scripts.
 - If a series has no positive actuals, all actuals are set to NaN and the SKU is effectively skipped downstream.
+- SARIMAX regressors are sourced from `salesforce_data/Salesforce Pipeline Monthly Summary.xlsx` (by `group_key`, `BU`, and Month) instead of the actuals file.
 
 ### 1) SARIMA/SARIMAX order search (`sarima_order_selector.py`)
 Purpose: choose a stable (p,d,q)(P,D,Q,s) order per SKU using SARIMAX with optional exogenous regressors.
@@ -97,6 +107,7 @@ Data requirements and skips:
 - If a SKU is missing an order in `sarimax_order_search_summary.xlsx`, it is skipped.
  - SARIMA baseline is only evaluated when there are at least 12 non-null months and at least 12 months since first non-zero actual.
  - SARIMAX regressors are only evaluated when there are at least 36 non-null months and SARIMA prerequisites are met.
+- A `skipped_products.csv` file is written with reasons for skips (no order, insufficient history, or pipeline ML prerequisites).
 
 Baseline models:
 - SARIMA baseline uses the chosen order from the order search and no exogenous regressors.
@@ -118,85 +129,103 @@ Regressor candidates (SARIMAX):
 - Regressor series are forward/back filled for ROCV, and a regressor is considered invalid if it is all-NaN or constant.
 
 Metrics and evaluation windows:
-- Test metrics use a final holdout block of `TEST_HORIZON = 12` months, but short histories use a reduced holdout (25% of history, minimum 6).
+- Test metrics always use a final holdout block of `TEST_HORIZON = 12` months for all models.
 - Rolling-origin CV (ROCV) uses `ROCV_HORIZON = 1` and `ROCV_MIN_OBS = 24`.
 - Baseline MAE values at or below `BASELINE_MAE_ZERO_EPS = 1e-9` are treated as effectively perfect.
+ - Holdout accuracy metrics (MAE/RMSE/Bias) are weighted toward recent months:
+   - Most recent 3 months = 55%
+   - Months 4-6 = 30%
+   - Months 7-12 = 15%
 
 ML challenger (optional):
-- GradientBoostingRegressor using lagged target features and calendar/trend:
+- `ML_GBR_PIPELINE` is evaluated when Salesforce pipeline history and summary data are available for the SKU:
+  - Baseline GBR on lagged actuals + calendar/trend.
+  - Adjustment GBR on residuals using pipeline + summary features.
+  - Metrics use the same 12-month holdout as other models.
+- If pipeline data is missing or incomplete, the engine falls back to legacy `ML_GBR`:
+  - GradientBoostingRegressor using lagged target features and calendar/trend.
   - Target lags: 1, 2, 3; lag 12 if 24+ observations.
   - Calendar: month-of-year; trend: index position.
   - Optional exogenous features if present: `New_Quotes`, `Open_Opportunities`, `Bookings` (with lags).
-- Requires enough rows after dropping NaNs; otherwise the model is skipped.
-- ROCV for ML rebuilds features at each origin and averages MAE.
+  - Requires enough rows after dropping NaNs; otherwise the model is skipped.
+  - ROCV for ML rebuilds features at each origin and averages MAE.
 
 Prophet challenger (optional):
 - Requires `prophet` to be installed and at least 24 months of usable history.
 - ROCV uses 1-step horizons with a minimum training length of 24.
 
-Recommended model selection (new logic):
-We anchor model selection on the most accurate forecast, and only deviate from it when another model is similarly accurate and exhibits believable demand variability.
+Recommended model selection (updated logic):
+We anchor on accuracy, keep ROCV as a sanity check only, and allow a directional-accuracy override when it materially improves decision usefulness without sacrificing accuracy.
 
 Inputs per candidate row:
 - `Product`, `Division`, `Model`
 - `Test_MAE`, `Test_RMSE`
-- `ROCV_MAE` (variability proxy; higher = more volatile)
+- `ROCV_MAE` (sanity-only; higher = more volatile)
+- Holdout forecast-vs-actual table to compute directional accuracy (DA)
 
-Step 1: Baseline model (most accurate)
+Step 0: Baseline model (most accurate)
 - `baseline_model` = model with lowest `Test_MAE`
-- `baseline_mae`, `baseline_rmse`, `baseline_rocv` are captured for thresholds
-- Baseline is always considered valid
+- Capture `baseline_mae`, `baseline_rmse`, `baseline_rocv`, and `baseline_DA`
+- Baseline always passes gates
 
-Step 2: Accuracy gate (relative to baseline)
+Step 1: Accuracy gate (relative to baseline)
 - `mae_cutoff = baseline_mae * (1 + mae_tolerance)`
 - `rmse_cutoff = baseline_rmse * (1 + rmse_tolerance)`
 - Defaults: `mae_tolerance = 0.20`, `rmse_tolerance = 0.20`
 - `passes_accuracy = (Test_MAE <= mae_cutoff) AND (Test_RMSE <= rmse_cutoff)`
-- Baseline always passes
 
-Step 3: ROCV hard-stop (variability sanity)
+Step 2: ROCV sanity check (non-preferential)
 - `rocv_hard_max = baseline_rocv * rocv_hard_multiplier`
 - Default: `rocv_hard_multiplier = 1.50`
-- `passes_rocv_hard = (ROCV_MAE <= rocv_hard_max)`
-- Baseline always passes
+- If baseline ROCV is missing or <=0, ROCV checks are disabled for the group
+- Otherwise, `passes_rocv_sanity = (ROCV_MAE <= rocv_hard_max)`; missing ROCV fails for non-baselines
 
-Step 4: Candidate set
-- `candidates = passes_accuracy AND passes_rocv_hard`
-- If empty, recommend baseline
-  - Reason: "No alternative model met accuracy and variability sanity thresholds; selected lowest-MAE baseline."
+Step 3: Candidate set and primary selection
+- `candidates = passes_accuracy AND passes_rocv_sanity`
+- `tentative_winner` = lowest `Test_MAE` in candidates
+- Tie-breakers: lower `Test_RMSE`, then alphabetical `Model`
 
-Step 5: Variability preference band (among candidates)
-- `rocv_preferred_min = baseline_rocv * rocv_preferred_lower`
-- `rocv_preferred_max = baseline_rocv * rocv_preferred_upper`
-- Defaults: `rocv_preferred_lower = 0.85`, `rocv_preferred_upper = 1.15`
-- `preferred_candidates = candidates with ROCV_MAE in [min, max]`
+Step 4: Directional accuracy override
+- DA = mean of sign(Actual[t] - Actual[t-1]) == sign(Forecast[t] - Forecast[t-1])
+- Require at least `DA_MIN_PERIODS = 6` valid deltas
+- Override challenger must satisfy:
+  - DA improves by >= `DA_IMPROVEMENT_PP = 0.10` (10pp)
+  - `Test_MAE <= baseline_mae * (1 + DA_CLOSE_MAE_TOL)` with default 0.05
+  - passes accuracy + ROCV sanity
+- If any challenger qualifies: pick highest DA; tie-break by MAE, RMSE, Model
 
-Step 6: Selection
-- If `preferred_candidates` non-empty:
-  - choose lowest `Test_MAE`
-  - tie-breakers: lower `Test_RMSE`, then alphabetical `Model`
-  - Reason: "Selected among accurate models with variability aligned to the baseline forecast."
-- Else:
-  - choose lowest `Test_MAE` from candidates
-  - Reason: "Selected most accurate model among those passing variability sanity checks."
-
-Step 7: Final safeguard
-- If selected is not baseline and ROCV is extreme vs baseline:
-  - too smooth: `ROCV_MAE < baseline_rocv * rocv_too_smooth` (default 0.70)
-  - too noisy: `ROCV_MAE > baseline_rocv * rocv_too_noisy` (default 1.5)
-- Revert to baseline with explicit fallback reason
+Step 5: Bias override (new)
+- Bias is computed on the same holdout block as MAE/RMSE:
+  - `bias = sum(Forecast - Actual)`
+  - `abs_bias = abs(bias)`
+  - `bias_pct = bias / sum(Actual)` with epsilon guard
+  - `abs_bias_pct = abs(bias_pct)`
+- Challenger must already be accuracy-qualified and also meet:
+  - `Test_MAE <= baseline_mae * (1 + mae_close_tol)` (default 0.10)
+  - `abs_bias_pct <= baseline_abs_bias_pct * bias_improvement_ratio` (default 0.70)
+  - optional RMSE-close check if enabled
+- If any bias challenger qualifies: pick lowest abs bias (pct), tie-break by MAE, RMSE, Model.
+- Bias override never special-cases ML; it can only select challengers already passing accuracy + ROCV sanity.
 
 Outputs (summary and debug):
 - `Product`, `Division`, `Recommended_Model`, `Reason`
-- `baseline_model`, `baseline_mae`, `baseline_rocv`
-- `mae_cutoff`, `rmse_cutoff`
-- `rocv_hard_max`, `rocv_preferred_min`, `rocv_preferred_max`
-- Optional per-model flags: `passes_accuracy`, `passes_rocv_hard`, `in_preferred_band`
+- `baseline_model`, `baseline_mae`, `baseline_rmse`, `baseline_rocv`, `baseline_DA`
+- `baseline_abs_bias`, `baseline_abs_bias_pct`
+- `mae_cutoff`, `rmse_cutoff`, `rocv_hard_max`
+- `recommended_mae`, `recommended_rmse`, `recommended_rocv`, `recommended_DA`
+- `recommended_bias`, `recommended_abs_bias`, `recommended_bias_pct`, `recommended_abs_bias_pct`
+- Per-model flags: `passes_accuracy`, `passes_rocv_sanity`, `candidate`, `DA`, `DA_Valid_Periods`,
+  `qualifies_mae_close`, `qualifies_bias`, `qualifies_rmse_close`, `used_bias_override`
 
 Outputs:
 - `sarima_multi_sku_summary.xlsx` contains the chosen model, baseline metrics, improvement %, and selected regressor name/lag.
 - `Model_Rankings` sheet includes all candidates and whether each passed the accuracy and ROCV gates.
 - `recommended_model_summary` sheet includes the recommended model, reason, and threshold fields used by the new selection logic.
+- If `--compare-model-selection` is used, CSVs are written to `data_storage/model_selection_eval/`:
+  - `model_selection_comparison_summary.csv`
+  - `model_selection_flips_bias_best.csv`
+  - `model_selection_flips_mae_worst.csv`
+  - `model_selection_detail_all.csv`
 
 ### 3) Forecast generation (`sarima_forecast.py`)
 Purpose: generate forecast variants for each SKU and flag the recommended model from the summary file.
@@ -210,6 +239,7 @@ History thresholds:
   - SARIMA prerequisites are met.
 - ETS baseline is always allowed; seasonal ETS requires 24+ months.
 - ML and Prophet are controlled by `ENABLE_ML_CHALLENGER` / `ENABLE_PROPHET_CHALLENGER` and package availability.
+ - ML forecasting uses `ML_GBR_PIPELINE` when pipeline data is available; otherwise it falls back to the legacy `ML_GBR` model.
 
 Regressor selection for forecasting:
 - Uses the regressor name/lag in `sarima_multi_sku_summary.xlsx` if present.
@@ -254,3 +284,7 @@ Edit these at the top of each script to change behavior:
 - Exogenous candidates include lagged Salesforce signals (`New_Opportunities`, `Open_Opportunities`) and `Bookings`; lag logic is explicitly defined in each script.
 - Rolling-origin CV and holdout windows are configured at the top of the scripts; adjust there for different horizons or minimum history.
 - Data files are ignored by Git; share them separately if collaborators need to reproduce runs.
+ - Model-selection unit tests are in `tests/test_model_selection.py` and can be run with:
+```bash
+python -m unittest tests/test_model_selection.py
+```

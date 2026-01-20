@@ -395,7 +395,7 @@ def run_order_search_for_all_products(
 # --------------------------------------------------
 if __name__ == "__main__":
     t0 = time.perf_counter()
-    combined_file = "all_products_with_sf_and_bookings.xlsx"
+    combined_file = "all_products_actuals_and_bookings.xlsx"
     df_all = pd.read_excel(combined_file)
     df_all = aggregate_monthly_duplicates(
         df_all,

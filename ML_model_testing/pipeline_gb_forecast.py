@@ -14,7 +14,7 @@ from sklearn.metrics import mean_squared_error
 
 BASE_DIR = Path(__file__).resolve().parent
 
-ACTUALS_PATH = BASE_DIR / "all_products_with_sf_and_bookings.xlsx"
+ACTUALS_PATH = BASE_DIR / "all_products_actuals_and_bookings.xlsx"
 PRODUCT_CATALOG_PATH = BASE_DIR / "product_catalog_master.xlsx"
 PIPELINE_FILES = sorted(BASE_DIR.glob("Merged Salesforce Pipeline *.xlsx"))
 SF_PRODUCT_REFERENCE_PATH = BASE_DIR / "sf_product_reference_key.csv"
