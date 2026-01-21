@@ -1,10 +1,20 @@
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message="No frequency information was provided*")
+try:
+    from statsmodels.tools.sm_exceptions import ConvergenceWarning, ValueWarning as SMValueWarning
+    warnings.filterwarnings("ignore", category=SMValueWarning)
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+except Exception:
+    pass
 
 import ast
+import io
+import logging
 import os
 import time
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -25,24 +35,39 @@ except Exception:
     Prophet = None
     PROPHET_AVAILABLE = False
 
+os.environ.setdefault("CMDSTANPY_LOG_LEVEL", "WARNING")
+os.environ.setdefault("STAN_LOG_LEVEL", "WARNING")
+logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+logging.getLogger("cmdstanpy").propagate = False
+logging.getLogger("prophet").setLevel(logging.WARNING)
+try:
+    import cmdstanpy
+    cmdstanpy.utils.get_logger().setLevel(logging.WARNING)
+except Exception:
+    pass
+
 # ===========================
 # 1. CONFIG
 # ===========================
 
 BASE_DIR = Path(__file__).resolve().parent
 SALESFORCE_DATA_DIR = BASE_DIR / "salesforce_data"
+if not SALESFORCE_DATA_DIR.exists():
+    SALESFORCE_DATA_DIR = BASE_DIR.parent / "salesforce_data"
 
-INPUT_FILE = "all_products_actuals_and_bookings.xlsx"  # <--- change to your file
-REVISED_ACTUALS_FILE = "all_products_actuals_and_bookings_revised.xlsx"
+INPUT_FILE = BASE_DIR / "all_products_actuals_and_bookings.xlsx"  # <--- change to your file
+REVISED_ACTUALS_FILE = BASE_DIR / "all_products_actuals_and_bookings_revised.xlsx"
 REVISED_ACTUALS_SHEET = "Revised Actuals"
-OUTPUT_FILE = "sarima_multi_sku_summary.xlsx"
+OUTPUT_FILE = BASE_DIR / "sarima_multi_sku_summary.xlsx"
 OUTPUT_DIR = BASE_DIR / "data_storage"
 HOLDOUT_TS_CSV = OUTPUT_DIR / "holdout_forecast_actuals.csv"
 HOLDOUT_TS_SHEET = "Holdout_Forecast_Actuals"
-ORDER_FILE = "sarimax_order_search_summary.xlsx"       # per-SKU SARIMA orders
-NOTES_FILE = "Notes.xlsx"                              # manual order overrides
+ORDER_FILE = BASE_DIR / "sarimax_order_search_summary.xlsx"       # per-SKU SARIMA orders
+NOTES_FILE = BASE_DIR / "Notes.xlsx"                              # manual order overrides
 ENABLE_ML_CHALLENGER = True
 ENABLE_PROPHET_CHALLENGER = True
+QUIET_MODEL_OUTPUT = True
+SKU_SUMMARY_ONLY = True
 PIPELINE_FILES = sorted(SALESFORCE_DATA_DIR.glob("Merged Salesforce Pipeline *.xlsx"))
 SUMMARY_REPORT_NAME = "Salesforce Pipeline Monthly Summary.xlsx"
 SUMMARY_PATH = SALESFORCE_DATA_DIR / SUMMARY_REPORT_NAME
@@ -86,6 +111,10 @@ DA_IMPROVEMENT_PP = 0.10
 DA_CLOSE_MAE_TOL = 0.05
 BASELINE_MAE_ZERO_EPS = 1e-9  # treat MAE at or below this as effectively zero
 ETS_SEASONAL_PERIODS = 12     # monthly data
+SBA_ALPHA = 0.1
+BLEND_SOFTMAX_TAU = 0.10
+BLEND_EPS = 1e-9
+BLEND_MODEL_NAME = "BLENDED_SOFTMAX"
 
 
 # ===========================
@@ -102,6 +131,35 @@ def _parse_args():
         help="Generate old vs new model selection comparison reports after the run.",
     )
     return parser.parse_args()
+
+
+@contextmanager
+def quiet_output(enabled: bool = True):
+    if not enabled:
+        yield
+        return
+    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        yield
+
+
+def sku_log(message: str):
+    if not SKU_SUMMARY_ONLY:
+        print(message)
+
+
+def format_sku_summary(idx, total, prod, div, ran=None, skipped=None, chosen=None, note=None):
+    ran = ran or []
+    skipped = skipped or []
+    parts = [f"[{idx}/{total}] {prod}/{div}"]
+    if chosen:
+        parts.append(f"chosen={chosen}")
+    if ran:
+        parts.append("ran=" + ",".join(ran))
+    if skipped:
+        parts.append("skipped=" + ",".join(skipped))
+    if note:
+        parts.append(f"note={note}")
+    return " | ".join(parts)
 
 
 def aggregate_monthly_duplicates(
@@ -220,6 +278,262 @@ def safe_rmse(y_true, y_pred):
     mask = np.isfinite(y_true) & np.isfinite(y_pred)
     if mask.sum() == 0:
         return np.nan
+    return np.sqrt(mean_squared_error(y_true[mask], y_pred[mask]))
+
+
+def compute_wape(actual, forecast, eps: float = BLEND_EPS) -> float:
+    """Weighted absolute percentage error using absolute-actuals denominator."""
+    actual = np.asarray(actual, dtype=float)
+    forecast = np.asarray(forecast, dtype=float)
+    mask = np.isfinite(actual) & np.isfinite(forecast)
+    if not mask.any():
+        return np.nan
+    denom = np.sum(np.abs(actual[mask]))
+    if denom <= eps:
+        return np.nan
+    return float(np.sum(np.abs(actual[mask] - forecast[mask])) / denom)
+
+
+def _add_holdout_horizon(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"])
+    df["Horizon"] = (
+        df.groupby([COL_PRODUCT, COL_DIVISION])["Date"]
+        .rank(method="dense")
+        .astype(int)
+    )
+    return df
+
+
+def _blend_family(model_name: str) -> Optional[str]:
+    if model_name == "SARIMA_baseline":
+        return "SARIMA"
+    if model_name.startswith("SARIMAX"):
+        return "SARIMAX"
+    if model_name == "ETS_baseline":
+        return "ETS"
+    if model_name == "SBA":
+        return "SBA"
+    if model_name == "PROPHET":
+        return "PROPHET"
+    if model_name in {"ML_GBR", PIPELINE_ML_MODEL_NAME}:
+        return "ML"
+    return None
+
+
+def _softmax_weights_from_wape(wape_by_family: Dict[str, float], tau: float) -> Dict[str, float]:
+    if not wape_by_family:
+        return {}
+    finite = {k: v for k, v in wape_by_family.items() if np.isfinite(v)}
+    if not finite:
+        return {}
+    best = min(finite.values())
+    denom = max(best, BLEND_EPS)
+    weights = {}
+    for fam, wape in finite.items():
+        gap = (wape - best) / denom
+        weights[fam] = float(np.exp(-gap / max(tau, BLEND_EPS)))
+    total = sum(weights.values())
+    if total <= BLEND_EPS:
+        return {}
+    return {fam: w / total for fam, w in weights.items()}
+
+
+def _build_softmax_blend(
+    holdout_df: pd.DataFrame,
+    metrics_list: List[dict],
+    tau: float = BLEND_SOFTMAX_TAU,
+) -> Tuple[Optional[dict], pd.DataFrame, List[dict]]:
+    if holdout_df.empty:
+        return None, pd.DataFrame(), []
+
+    df = _add_holdout_horizon(holdout_df)
+    df["Family"] = df["Model"].apply(_blend_family)
+    df = df[df["Family"].notna()]
+    if df.empty:
+        return None, pd.DataFrame(), []
+
+    # Choose best model per family by overall WAPE on the holdout.
+    overall_wape = (
+        df.groupby(["Family", "Model"], dropna=False)
+        .apply(lambda g: compute_wape(g["Actual"], g["Forecast"]))
+        .reset_index(name="WAPE")
+    )
+    overall_wape = overall_wape[np.isfinite(overall_wape["WAPE"])]
+    if overall_wape.empty:
+        return None, pd.DataFrame(), []
+
+    selected = {}
+    for family, group in overall_wape.groupby("Family"):
+        best_row = group.sort_values("WAPE", ascending=True).iloc[0]
+        selected[family] = best_row["Model"]
+
+    overall_wape_map = {
+        fam: overall_wape.loc[overall_wape["Model"] == model, "WAPE"].min()
+        for fam, model in selected.items()
+    }
+    overall_weights = _softmax_weights_from_wape(overall_wape_map, tau)
+
+    # Per-horizon weights (using chosen model per family).
+    weight_rows = []
+    weights_by_horizon = {}
+    for horizon, h_df in df.groupby("Horizon"):
+        wape_by_family = {}
+        for family, model in selected.items():
+            g = h_df[h_df["Model"] == model]
+            if g.empty:
+                continue
+            wape = compute_wape(g["Actual"], g["Forecast"])
+            if np.isfinite(wape):
+                wape_by_family[family] = wape
+        weights = _softmax_weights_from_wape(wape_by_family, tau)
+        if not weights:
+            continue
+        weights_by_horizon[int(horizon)] = {
+            selected[fam]: weight for fam, weight in weights.items()
+        }
+        for family, weight in weights.items():
+            weight_rows.append({
+                COL_PRODUCT: h_df[COL_PRODUCT].iloc[0],
+                COL_DIVISION: h_df[COL_DIVISION].iloc[0],
+                "Horizon": int(horizon),
+                "Model_Family": family,
+                "Model": selected[family],
+                "WAPE": wape_by_family.get(family, np.nan),
+                "Weight": weight,
+                "Tau": tau,
+                "Weight_Source": "holdout_horizon",
+            })
+
+    selected_models = list(selected.values())
+    df_sel = df[df["Model"].isin(selected_models)]
+    if df_sel.empty:
+        return None, pd.DataFrame(), weight_rows
+
+    pivot = df_sel.pivot_table(
+        index=[COL_PRODUCT, COL_DIVISION, "Date", "Horizon"],
+        columns="Model",
+        values="Forecast",
+        aggfunc="mean",
+    )
+    actuals = (
+        df_sel.groupby([COL_PRODUCT, COL_DIVISION, "Date", "Horizon"])["Actual"]
+        .mean()
+    )
+    blended_rows = []
+    for idx, row in pivot.iterrows():
+        prod, div, date, horizon = idx
+        weights = weights_by_horizon.get(int(horizon))
+        if not weights:
+            weights = {selected[fam]: w for fam, w in overall_weights.items()}
+        if not weights:
+            continue
+        total = 0.0
+        weight_sum = 0.0
+        for model_name, weight in weights.items():
+            if model_name in row and np.isfinite(row[model_name]):
+                total += weight * row[model_name]
+                weight_sum += weight
+        if weight_sum <= BLEND_EPS:
+            continue
+        blended_rows.append({
+            COL_PRODUCT: prod,
+            COL_DIVISION: div,
+            "Model": BLEND_MODEL_NAME,
+            "Date": pd.to_datetime(date),
+            "Actual": actuals.loc[idx],
+            "Forecast": total / weight_sum,
+        })
+
+    blended_holdout = pd.DataFrame(blended_rows)
+    if blended_holdout.empty:
+        return None, pd.DataFrame(), weight_rows
+
+    blend_mae = safe_mae(blended_holdout["Actual"].values, blended_holdout["Forecast"].values)
+    blend_rmse = safe_rmse(blended_holdout["Actual"].values, blended_holdout["Forecast"].values)
+    blend_wape = compute_wape(blended_holdout["Actual"], blended_holdout["Forecast"])
+
+    rocv_map = {m.get("Model"): m.get("ROCV_MAE", np.nan) for m in metrics_list}
+    rocv_weight_sum = 0.0
+    rocv_total = 0.0
+    for family, model_name in selected.items():
+        weight = overall_weights.get(family)
+        rocv_val = rocv_map.get(model_name, np.nan)
+        if weight is None or not np.isfinite(rocv_val):
+            continue
+        rocv_total += weight * rocv_val
+        rocv_weight_sum += weight
+    blend_rocv = rocv_total / rocv_weight_sum if rocv_weight_sum > BLEND_EPS else np.nan
+
+    blend_metrics = {
+        "Model": BLEND_MODEL_NAME,
+        "Test_MAE": blend_mae,
+        "Test_RMSE": blend_rmse,
+        "ROCV_MAE": blend_rocv,
+        "AIC": np.nan,
+        "BIC": np.nan,
+        "WAPE": blend_wape,
+        "Skip_Reason": "",
+        "Forecast_valid": True,
+    }
+    return blend_metrics, blended_holdout, weight_rows
+
+
+def _sba_forecast_value(y_train: pd.Series, alpha: float = SBA_ALPHA) -> float:
+    """
+    Syntetos-Boylan Approximation (SBA) forecast for intermittent demand.
+    Returns the constant forecast level for the horizon.
+    """
+    y = pd.Series(y_train).astype(float).dropna()
+    if y.empty:
+        return np.nan
+
+    z = None
+    p = None
+    q = 0.0
+    for demand in y.values:
+        q += 1.0
+        if demand > 0:
+            if z is None:
+                z = float(demand)
+                p = float(q)
+            else:
+                z = z + alpha * (float(demand) - z)
+                p = p + alpha * (q - p)
+            q = 0.0
+
+    if z is None or p is None or p == 0:
+        return 0.0
+
+    return float((1.0 - alpha / 2.0) * (z / p))
+
+
+def rolling_origin_cv_sba(
+    y: pd.Series,
+    alpha: float = SBA_ALPHA,
+    horizon: int = ROCV_HORIZON,
+    min_obs: int = ROCV_MIN_OBS,
+) -> float:
+    """Rolling-origin MAE for SBA."""
+    y = pd.Series(y).astype(float).dropna()
+    n = len(y)
+    if n < min_obs + horizon:
+        return np.nan
+
+    errors = []
+    for origin in range(min_obs, n - horizon + 1):
+        y_train = y.iloc[:origin]
+        y_test = y.iloc[origin:origin + horizon]
+        forecast_value = _sba_forecast_value(y_train, alpha=alpha)
+        preds = np.repeat(forecast_value, len(y_test))
+        err = safe_mae(y_test.values, preds)
+        if not np.isnan(err):
+            errors.append(err)
+
+    if not errors:
+        return np.nan
+    return float(np.mean(errors))
     mse = mean_squared_error(y_true[mask], y_pred[mask])  # no squared arg
     return np.sqrt(mse)
 
@@ -1144,7 +1458,8 @@ def _fit_ets_candidate(y_train, spec, use_state_space: bool):
             seasonal_periods=spec["seasonal_periods"],
             initialization_method="estimated",
         )
-        return model.fit()
+        with quiet_output(QUIET_MODEL_OUTPUT):
+            return model.fit(disp=False)
 
     model = ExponentialSmoothing(
         y_train,
@@ -1154,7 +1469,8 @@ def _fit_ets_candidate(y_train, spec, use_state_space: bool):
         seasonal_periods=spec["seasonal_periods"] if spec["seasonal"] is not None else None,
         initialization_method="estimated",
     )
-    return model.fit(optimized=True)
+    with quiet_output(QUIET_MODEL_OUTPUT):
+        return model.fit(optimized=True, disp=False)
 
 
 def _select_best_ets_model(y_train, context: str = ""):
@@ -1168,7 +1484,7 @@ def _select_best_ets_model(y_train, context: str = ""):
             res = _fit_ets_candidate(y_train, spec, use_state_space=True)
             score = _info_criterion(res)
         except Exception as exc:
-            print(f"[WARN] ETSModel failed ({spec}){context}: {exc}")
+            sku_log(f"[WARN] ETSModel failed ({spec}){context}: {exc}")
             continue
 
         if score < best_score:
@@ -1187,7 +1503,7 @@ def _select_best_ets_model(y_train, context: str = ""):
             res = _fit_ets_candidate(y_train, spec, use_state_space=False)
             score = _info_criterion(res)
         except Exception as exc:
-            print(f"[WARN] ExponentialSmoothing failed ({spec}){context}: {exc}")
+            sku_log(f"[WARN] ExponentialSmoothing failed ({spec}){context}: {exc}")
             continue
 
         if score < best_score:
@@ -1552,7 +1868,8 @@ def fit_sarima_baseline(y_train, order, seasonal_order):
         enforce_stationarity=False,
         enforce_invertibility=False
     )
-    res = model.fit(disp=False)
+    with quiet_output(QUIET_MODEL_OUTPUT):
+        res = model.fit(disp=False)
     return res
 
 
@@ -1566,7 +1883,8 @@ def fit_sarimax(y_train, exog_train, order, seasonal_order):
         enforce_stationarity=False,
         enforce_invertibility=False
     )
-    res = model.fit(disp=False)
+    with quiet_output(QUIET_MODEL_OUTPUT):
+        res = model.fit(disp=False)
     return res
 
 
@@ -1679,7 +1997,7 @@ def evaluate_single_model(
         coverage = exog_train.notna().mean()
         if coverage < 0.7:
             sku_txt = f"{sku}/{bu}" if sku or bu else ""
-            print(f"[WARN] Low exog coverage ({coverage:.2%}) for {sku_txt}. Proceeding with cleaned exog.")
+            sku_log(f"[WARN] Low exog coverage ({coverage:.2%}) for {sku_txt}. Proceeding with cleaned exog.")
 
         # If still all NaN after cleaning, bail with large MAE
         if exog_train.notna().sum() == 0:
@@ -1869,6 +2187,68 @@ def evaluate_ets_model(
     return metrics, holdout_df
 
 
+def evaluate_sba_model(
+    y,
+    model_name="SBA",
+    horizon=TEST_HORIZON,
+    sku=None,
+    bu=None,
+    alpha: float = SBA_ALPHA,
+    return_holdout: bool = False,
+):
+    """
+    Fit SBA model, compute test MAE/RMSE on last 'horizon' points,
+    compute ROCV MAE, and return a dict of metrics.
+    """
+    y = pd.Series(y).astype(float)
+    y_clean = y.dropna()
+    n_total = len(y_clean)
+
+    if n_total <= horizon:
+        metrics = {
+            "Model": model_name,
+            "Test_MAE": np.nan,
+            "Test_RMSE": np.nan,
+            "AIC": np.nan,
+            "BIC": np.nan,
+            "ROCV_MAE": np.nan,
+            "Regressor_coef": np.nan,
+            "Regressor_pvalue": np.nan,
+        }
+        return (metrics, pd.DataFrame()) if return_holdout else metrics
+
+    train_end = n_total - horizon
+    y_train = y_clean.iloc[:train_end]
+    y_test = y_clean.iloc[train_end:]
+
+    forecast_value = _sba_forecast_value(y_train, alpha=alpha)
+    y_pred = pd.Series(np.repeat(forecast_value, len(y_test)), index=y_test.index)
+
+    rocv_mae = rolling_origin_cv_sba(y_clean, alpha=alpha, horizon=ROCV_HORIZON, min_obs=ROCV_MIN_OBS)
+
+    metrics = {
+        "Model": model_name,
+        "Test_MAE": safe_mae(y_test.values, y_pred.values),
+        "Test_RMSE": safe_rmse(y_test.values, y_pred.values),
+        "AIC": np.nan,
+        "BIC": np.nan,
+        "ROCV_MAE": float(rocv_mae) if np.isfinite(rocv_mae) else np.nan,
+        "Regressor_coef": np.nan,
+        "Regressor_pvalue": np.nan,
+    }
+    if not return_holdout:
+        return metrics
+    holdout_df = _build_holdout_df(
+        sku,
+        bu,
+        metrics["Model"],
+        y_test.index,
+        y_test.values,
+        y_pred.values,
+    )
+    return metrics, holdout_df
+
+
 def _prepare_prophet_df(y_series: pd.Series) -> pd.DataFrame:
     df = pd.DataFrame({
         "ds": pd.to_datetime(y_series.index).tz_localize(None),
@@ -1936,7 +2316,8 @@ def _evaluate_prophet_metrics(y_series, horizon=TEST_HORIZON, sku=None, bu=None,
             seasonality_mode="additive",
             changepoint_prior_scale=0.05,
         )
-        model.fit(train_df)
+        with quiet_output(QUIET_MODEL_OUTPUT):
+            model.fit(train_df)
 
         future_df = pd.DataFrame({"ds": y_test.index})
         future_df["ds"] = pd.to_datetime(future_df["ds"]).dt.tz_localize(None)
@@ -1949,7 +2330,7 @@ def _evaluate_prophet_metrics(y_series, horizon=TEST_HORIZON, sku=None, bu=None,
         metrics["Forecast_valid"] = np.isfinite(y_pred.values).all() and len(y_pred) == len(y_test)
     except Exception as exc:
         sku_txt = f"{sku}/{bu}" if sku or bu else ""
-        print(f"Prophet failed for SKU {sku_txt}: {exc}")
+        sku_log(f"Prophet failed for SKU {sku_txt}: {exc}")
         metrics["Skip_Reason"] = f"Prophet failed: {exc}"
         return (metrics, pd.DataFrame()) if return_holdout else metrics
 
@@ -1970,7 +2351,8 @@ def _evaluate_prophet_metrics(y_series, horizon=TEST_HORIZON, sku=None, bu=None,
                 seasonality_mode="additive",
                 changepoint_prior_scale=0.05,
             )
-            model.fit(train_df)
+            with quiet_output(QUIET_MODEL_OUTPUT):
+                model.fit(train_df)
             future_df = pd.DataFrame({"ds": y_test_rocv.index})
             future_df["ds"] = pd.to_datetime(future_df["ds"]).dt.tz_localize(None)
             future_df["ds"] = future_df["ds"].dt.to_period("M").dt.to_timestamp()
@@ -2626,6 +3008,10 @@ def _model_type(model_name: str) -> str:
         return "PROPHET"
     if model_name == "ETS_baseline":
         return "ETS"
+    if model_name == "SBA":
+        return "SBA"
+    if model_name == BLEND_MODEL_NAME:
+        return "BLEND"
     if model_name == "SARIMA_baseline":
         return "SARIMA"
     if model_name.startswith("SARIMAX"):
@@ -2935,6 +3321,7 @@ def main():
     recommended_rows = []
     ranking_rows_all = []
     holdout_rows_all = []
+    blend_weight_rows_all = []
     skipped_no_order = []
     skipped_products = []
 
@@ -2943,11 +3330,13 @@ def main():
     total_skus = len(sku_groups)
     print(f"Found {total_skus} product+division combinations.")
 
-    for (prod, div), df_sku in sku_groups:
-        print(f"\n=== Processing SKU: {prod}, Division: {div} ===")
+    for idx, ((prod, div), df_sku) in enumerate(sku_groups, start=1):
+        models_ran = []
+        models_skipped = []
+        sku_log(f"\n=== [{idx}/{total_skus}] Processing SKU: {prod}, Division: {div} ===")
         order_pair = orders_map.get(normalize_key(prod, div))
         if order_pair is None:
-            print("  -> Skipping: no order/seasonal_order found in sarimax_order_search_summary.")
+            sku_log("  -> Skipping: no order/seasonal_order found in sarimax_order_search_summary.")
             skipped_no_order.append({"Product": prod, "Division": div, "Reason": "No order in order search summary"})
             skipped_products.append(
                 {
@@ -2998,6 +3387,15 @@ def main():
                 "recommended_abs_bias_pct": np.nan,
                 "used_bias_override": False,
             })
+            print(format_sku_summary(
+                idx,
+                total_skus,
+                prod,
+                div,
+                ran=models_ran,
+                skipped=["NO_ORDER_IN_FILE"],
+                chosen="NO_ORDER_IN_FILE",
+            ))
             continue
 
         order, seasonal_order = order_pair
@@ -3046,7 +3444,7 @@ def main():
         test_horizon = _compute_test_window(history_months)
 
         if n < MIN_OBS_TOTAL:
-            print(f"  -> Skipping (only {n} observations; need at least {MIN_OBS_TOTAL}).")
+            sku_log(f"  -> Skipping (only {n} observations; need at least {MIN_OBS_TOTAL}).")
             skipped_products.append(
                 {
                     "Product": prod,
@@ -3096,6 +3494,15 @@ def main():
                 "recommended_abs_bias_pct": np.nan,
                 "used_bias_override": False,
             })
+            print(format_sku_summary(
+                idx,
+                total_skus,
+                prod,
+                div,
+                ran=models_ran,
+                skipped=[f"INSUFFICIENT_HISTORY<{MIN_OBS_TOTAL}"],
+                chosen="INSUFFICIENT_HISTORY",
+            ))
             continue
 
         metrics_list = []
@@ -3104,7 +3511,8 @@ def main():
 
         # --- Baseline model ---
         if allow_sarima:
-            print("  Fitting SARIMA_baseline...")
+            models_ran.append("SARIMA")
+            sku_log("  Fitting SARIMA_baseline...")
             baseline_metrics, holdout_df = evaluate_single_model(
                 y=y,
                 exog=None,
@@ -3125,7 +3533,7 @@ def main():
                 and not np.isnan(baseline_metrics.get("Test_MAE", np.nan))
                 and abs(baseline_metrics["Test_MAE"]) <= BASELINE_MAE_ZERO_EPS
             ):
-                print(f"[INFO] Baseline MAE ~0 for {prod}/{div}; treating as perfect baseline.")
+                sku_log(f"[INFO] Baseline MAE ~0 for {prod}/{div}; treating as perfect baseline.")
             metrics_list.append(baseline_metrics)
             ranking_rows.append({
                 "Product": prod,
@@ -3141,10 +3549,12 @@ def main():
                 "Accepted_by_rules": False  # baseline not part of acceptance set
             })
         else:
-            print("  Skipping SARIMA_baseline: history <12 months or first non-zero <12 months ago.")
+            models_skipped.append("SARIMA(gated)")
+            sku_log("  Skipping SARIMA_baseline: history <12 months or first non-zero <12 months ago.")
 
         # --- ETS baseline ---
-        print("  Fitting ETS_baseline...")
+        models_ran.append("ETS")
+        sku_log("  Fitting ETS_baseline...")
         ets_metrics, holdout_df = evaluate_ets_model(
             y=y,
             model_name="ETS_baseline",
@@ -3172,12 +3582,43 @@ def main():
             "Accepted_by_rules": False
         })
 
+        # --- SBA challenger ---
+        models_ran.append("SBA")
+        sku_log("  Fitting SBA...")
+        sba_metrics, holdout_df = evaluate_sba_model(
+            y=y,
+            model_name="SBA",
+            horizon=test_horizon,
+            sku=prod,
+            bu=div,
+            return_holdout=True,
+        )
+        if not holdout_df.empty:
+            holdout_rows.append(holdout_df)
+            holdout_rows_all.append(holdout_df)
+        metrics_list.append(sba_metrics)
+        ranking_rows.append({
+            "Product": prod,
+            "Division": div,
+            "Model": sba_metrics["Model"],
+            "Test_MAE": sba_metrics["Test_MAE"],
+            "Test_RMSE": sba_metrics["Test_RMSE"],
+            "ROCV_MAE": sba_metrics["ROCV_MAE"],
+            "AIC": sba_metrics["AIC"],
+            "BIC": sba_metrics["BIC"],
+            "Regressor_Name": None,
+            "Regressor_Lag": None,
+            "Accepted_by_rules": False
+        })
+
         # --- SARIMAX with New_Opportunities lags 1-3 ---
+        sarimax_newopp_ran = False
         if allow_sarimax:
             for lag in [1, 2, 3]:
                 col = f"New_Opportunities_l{lag}"
                 if col in df_sku.columns:
-                    print(f"  Fitting SARIMAX_{col}...")
+                    sarimax_newopp_ran = True
+                    sku_log(f"  Fitting SARIMAX_{col}...")
                     exog_series = df_sku[col].astype(float)
                     exog_clean_full = exog_series.ffill().bfill()
                     non_nan = exog_clean_full.dropna()
@@ -3214,15 +3655,22 @@ def main():
                         "Regressor_Lag": lag,
                         "Accepted_by_rules": False  # updated later once chosen
                     })
+            if sarimax_newopp_ran:
+                models_ran.append("SARIMAX_NewOpp")
+            else:
+                models_skipped.append("SARIMAX_NewOpp(no_col)")
         else:
-            print("  Skipping SARIMAX (New_Opportunities): history <36 months or SARIMA gate not met.")
+            models_skipped.append("SARIMAX_NewOpp(gated)")
+            sku_log("  Skipping SARIMAX (New_Opportunities): history <36 months or SARIMA gate not met.")
 
         # --- SARIMAX with Open_Opportunities lags 1-3 ---
+        sarimax_openopp_ran = False
         if allow_sarimax:
             for lag in [1, 2, 3]:
                 col = f"Open_Opportunities_l{lag}"
                 if col in df_sku.columns:
-                    print(f"  Fitting SARIMAX_{col}...")
+                    sarimax_openopp_ran = True
+                    sku_log(f"  Fitting SARIMAX_{col}...")
                     exog_series = df_sku[col].astype(float)
                     exog_clean_full = exog_series.ffill().bfill()
                     non_nan = exog_clean_full.dropna()
@@ -3259,15 +3707,22 @@ def main():
                         "Regressor_Lag": lag,
                         "Accepted_by_rules": False
                     })
+            if sarimax_openopp_ran:
+                models_ran.append("SARIMAX_OpenOpp")
+            else:
+                models_skipped.append("SARIMAX_OpenOpp(no_col)")
         else:
-            print("  Skipping SARIMAX (Open_Opportunities): history <36 months or SARIMA gate not met.")
+            models_skipped.append("SARIMAX_OpenOpp(gated)")
+            sku_log("  Skipping SARIMAX (Open_Opportunities): history <36 months or SARIMA gate not met.")
 
         # --- SARIMAX with Bookings lags 1-2 ---
+        sarimax_bookings_ran = False
         if allow_sarimax:
             for lag in [1, 2]:
                 col = f"Bookings_l{lag}"
                 if col in df_sku.columns:
-                    print(f"  Fitting SARIMAX_{col}...")
+                    sarimax_bookings_ran = True
+                    sku_log(f"  Fitting SARIMAX_{col}...")
                     exog_series = df_sku[col].astype(float)
                     exog_clean_full = exog_series.ffill().bfill()
                     non_nan = exog_clean_full.dropna()
@@ -3304,15 +3759,22 @@ def main():
                         "Regressor_Lag": lag,
                         "Accepted_by_rules": False
                     })
+            if sarimax_bookings_ran:
+                models_ran.append("SARIMAX_Bookings")
+            else:
+                models_skipped.append("SARIMAX_Bookings(no_col)")
         else:
-            print("  Skipping SARIMAX (Bookings): history <36 months or SARIMA gate not met.")
+            models_skipped.append("SARIMAX_Bookings(gated)")
+            sku_log("  Skipping SARIMAX (Bookings): history <36 months or SARIMA gate not met.")
 
         # --- SARIMAX with Median_Months_Since_Last_Activity lags 1-2 ---
+        sarimax_median_ran = False
         if allow_sarimax:
             for lag in [1, 2]:
                 col = f"Median_Months_Since_Last_Activity_l{lag}"
                 if col in df_sku.columns:
-                    print(f"  Fitting SARIMAX_{col}...")
+                    sarimax_median_ran = True
+                    sku_log(f"  Fitting SARIMAX_{col}...")
                     exog_series = df_sku[col].astype(float)
                     exog_clean_full = exog_series.ffill().bfill()
                     non_nan = exog_clean_full.dropna()
@@ -3349,15 +3811,22 @@ def main():
                         "Regressor_Lag": lag,
                         "Accepted_by_rules": False
                     })
+            if sarimax_median_ran:
+                models_ran.append("SARIMAX_MedianMo")
+            else:
+                models_skipped.append("SARIMAX_MedianMo(no_col)")
         else:
-            print("  Skipping SARIMAX (Median_Months_Since_Last_Activity): history <36 months or SARIMA gate not met.")
+            models_skipped.append("SARIMAX_MedianMo(gated)")
+            sku_log("  Skipping SARIMAX (Median_Months_Since_Last_Activity): history <36 months or SARIMA gate not met.")
 
         # --- SARIMAX with Open_Not_Modified_90_Days lag 1 ---
+        sarimax_open90_ran = False
         if allow_sarimax:
             for lag in [1]:
                 col = f"Open_Not_Modified_90_Days_l{lag}"
                 if col in df_sku.columns:
-                    print(f"  Fitting SARIMAX_{col}...")
+                    sarimax_open90_ran = True
+                    sku_log(f"  Fitting SARIMAX_{col}...")
                     exog_series = df_sku[col].astype(float)
                     exog_clean_full = exog_series.ffill().bfill()
                     non_nan = exog_clean_full.dropna()
@@ -3394,15 +3863,22 @@ def main():
                         "Regressor_Lag": lag,
                         "Accepted_by_rules": False
                     })
+            if sarimax_open90_ran:
+                models_ran.append("SARIMAX_Open90")
+            else:
+                models_skipped.append("SARIMAX_Open90(no_col)")
         else:
-            print("  Skipping SARIMAX (Open_Not_Modified_90_Days): history <36 months or SARIMA gate not met.")
+            models_skipped.append("SARIMAX_Open90(gated)")
+            sku_log("  Skipping SARIMAX (Open_Not_Modified_90_Days): history <36 months or SARIMA gate not met.")
 
         # --- SARIMAX with Pct_Open_Not_Modified_90_Days lags 1-2 ---
+        sarimax_pctopen_ran = False
         if allow_sarimax:
             for lag in [1, 2]:
                 col = f"Pct_Open_Not_Modified_90_Days_l{lag}"
                 if col in df_sku.columns:
-                    print(f"  Fitting SARIMAX_{col}...")
+                    sarimax_pctopen_ran = True
+                    sku_log(f"  Fitting SARIMAX_{col}...")
                     exog_series = df_sku[col].astype(float)
                     exog_clean_full = exog_series.ffill().bfill()
                     non_nan = exog_clean_full.dropna()
@@ -3439,15 +3915,22 @@ def main():
                         "Regressor_Lag": lag,
                         "Accepted_by_rules": False
                     })
+            if sarimax_pctopen_ran:
+                models_ran.append("SARIMAX_PctOpen90")
+            else:
+                models_skipped.append("SARIMAX_PctOpen90(no_col)")
         else:
-            print("  Skipping SARIMAX (Pct_Open_Not_Modified_90_Days): history <36 months or SARIMA gate not met.")
+            models_skipped.append("SARIMAX_PctOpen90(gated)")
+            sku_log("  Skipping SARIMAX (Pct_Open_Not_Modified_90_Days): history <36 months or SARIMA gate not met.")
 
         # --- SARIMAX with Early_to_Late_Ratio lags 1-2 ---
+        sarimax_earlylate_ran = False
         if allow_sarimax:
             for lag in [1, 2]:
                 col = f"Early_to_Late_Ratio_l{lag}"
                 if col in df_sku.columns:
-                    print(f"  Fitting SARIMAX_{col}...")
+                    sarimax_earlylate_ran = True
+                    sku_log(f"  Fitting SARIMAX_{col}...")
                     exog_series = df_sku[col].astype(float)
                     exog_clean_full = exog_series.ffill().bfill()
                     non_nan = exog_clean_full.dropna()
@@ -3484,8 +3967,13 @@ def main():
                         "Regressor_Lag": lag,
                         "Accepted_by_rules": False
                     })
+            if sarimax_earlylate_ran:
+                models_ran.append("SARIMAX_EarlyLate")
+            else:
+                models_skipped.append("SARIMAX_EarlyLate(no_col)")
         else:
-            print("  Skipping SARIMAX (Early_to_Late_Ratio): history <36 months or SARIMA gate not met.")
+            models_skipped.append("SARIMAX_EarlyLate(gated)")
+            sku_log("  Skipping SARIMAX (Early_to_Late_Ratio): history <36 months or SARIMA gate not met.")
 
         # --- ML challenger (GradientBoostingRegressor) ---
         if enable_ml:
@@ -3498,7 +3986,8 @@ def main():
                 pipeline_reason = "No pipeline history rows."
 
             if not pipeline_reason and feature_mode is not None:
-                print(f"  Evaluating {PIPELINE_ML_MODEL_NAME}...")
+                models_ran.append("ML_PIPE")
+                sku_log(f"  Evaluating {PIPELINE_ML_MODEL_NAME}...")
                 actuals_df = df_sku.reset_index()[[COL_DATE, COL_ACTUALS]].copy()
                 actuals_df = actuals_df.rename(columns={COL_DATE: "Month", COL_ACTUALS: "Actuals"})
                 actuals_df["Month"] = month_start(actuals_df["Month"])
@@ -3523,6 +4012,7 @@ def main():
                     use_pipeline_ml = True
 
             if pipeline_reason:
+                models_skipped.append("ML_PIPE(skip)")
                 skipped_products.append(
                     {
                         "Product": prod,
@@ -3533,7 +4023,8 @@ def main():
                 )
 
             if not use_pipeline_ml:
-                print("  Evaluating ML_GBR...")
+                models_ran.append("ML_GBR")
+                sku_log("  Evaluating ML_GBR...")
                 ml_metrics, holdout_df = evaluate_ml_candidate(
                     df_sku,
                     horizon=test_horizon,
@@ -3547,7 +4038,8 @@ def main():
 
             metrics_list.append(ml_metrics)
             if ml_metrics.get("Skip_Reason"):
-                print(f"  -> ML skipped: {ml_metrics['Skip_Reason']}")
+                models_skipped.append("ML_GBR(skip)")
+                sku_log(f"  -> ML skipped: {ml_metrics['Skip_Reason']}")
             ranking_rows.append({
                 "Product": prod,
                 "Division": div,
@@ -3566,7 +4058,8 @@ def main():
 
         # --- Prophet challenger ---
         if enable_prophet:
-            print("  Evaluating PROPHET...")
+            models_ran.append("PROPHET")
+            sku_log("  Evaluating PROPHET...")
             prophet_metrics, holdout_df = _evaluate_prophet_metrics(
                 y, horizon=test_horizon, sku=prod, bu=div, return_holdout=True
             )
@@ -3575,7 +4068,8 @@ def main():
                 holdout_rows.append(holdout_df)
                 holdout_rows_all.append(holdout_df)
             if prophet_metrics.get("Skip_Reason"):
-                print(f"  -> Prophet skipped: {prophet_metrics['Skip_Reason']}")
+                models_skipped.append("PROPHET(skip)")
+                sku_log(f"  -> Prophet skipped: {prophet_metrics['Skip_Reason']}")
             ranking_rows.append({
                 "Product": prod,
                 "Division": div,
@@ -3592,9 +4086,45 @@ def main():
                 "Skip_Reason": prophet_metrics.get("Skip_Reason", ""),
             })
 
+        holdout_df = pd.concat(holdout_rows, ignore_index=True) if holdout_rows else pd.DataFrame()
+        blend_metrics, blend_holdout, weight_rows = _build_softmax_blend(
+            holdout_df,
+            metrics_list,
+            tau=BLEND_SOFTMAX_TAU,
+        )
+        if blend_metrics is not None and not blend_holdout.empty:
+            metrics_list.append(blend_metrics)
+            holdout_rows.append(blend_holdout)
+            holdout_rows_all.append(blend_holdout)
+            blend_weight_rows_all.extend(weight_rows)
+            ranking_rows.append({
+                "Product": prod,
+                "Division": div,
+                "Model": blend_metrics["Model"],
+                "Model_Type": _model_type(blend_metrics["Model"]),
+                "Test_MAE": blend_metrics["Test_MAE"],
+                "Test_RMSE": blend_metrics["Test_RMSE"],
+                "ROCV_MAE": blend_metrics["ROCV_MAE"],
+                "AIC": blend_metrics["AIC"],
+                "BIC": blend_metrics["BIC"],
+                "Regressor_Name": None,
+                "Regressor_Lag": None,
+                "Accepted_by_rules": False,
+                "Skip_Reason": "",
+            })
+            holdout_df = pd.concat(holdout_rows, ignore_index=True)
+
+        if not holdout_df.empty:
+            wape_by_model = (
+                holdout_df.groupby("Model", dropna=False)
+                .apply(lambda g: compute_wape(g["Actual"], g["Forecast"]))
+                .to_dict()
+            )
+            for row in ranking_rows:
+                row["WAPE"] = wape_by_model.get(row["Model"], np.nan)
+
         # --- Choose best model using recommended logic ---
         metrics_df = pd.DataFrame(ranking_rows)
-        holdout_df = pd.concat(holdout_rows, ignore_index=True) if holdout_rows else pd.DataFrame()
         selection_summary, ranking_df = select_recommended_model(
             metrics_df,
             holdout_df,
@@ -3654,7 +4184,7 @@ def main():
             best_nonbaseline = min(sarimax_candidates, key=mae_rmse_key_local)
 
         if best_model is None:
-            print("  -> No valid model metrics; marking as FAILED.")
+            sku_log("  -> No valid model metrics; marking as FAILED.")
             results_rows.append({
                 "Product": prod,
                 "Division": div,
@@ -3699,6 +4229,16 @@ def main():
                 "recommended_abs_bias_pct": np.nan,
                 "used_bias_override": False,
             })
+            print(format_sku_summary(
+                idx,
+                total_skus,
+                prod,
+                div,
+                ran=models_ran,
+                skipped=models_skipped,
+                chosen="FAILED",
+                note="No valid model metrics",
+            ))
             continue
 
         # Baseline info
@@ -3791,8 +4331,11 @@ def main():
 
         accepted_by_rules = bool(baseline is not None and best_model["Model"] != baseline.get("Model"))
 
-        print(f"  -> Chosen model: {best_model['Model']}")
-        print(f"     Baseline MAE: {baseline_mae:.3f} | Chosen MAE: {chosen_mae:.3f} | Improvement: {mae_improvement_pct * 100 if not np.isnan(mae_improvement_pct) else np.nan:.2f}%")
+        sku_log(f"  -> Chosen model: {best_model['Model']}")
+        sku_log(
+            f"     Baseline MAE: {baseline_mae:.3f} | Chosen MAE: {chosen_mae:.3f} | "
+            f"Improvement: {mae_improvement_pct * 100 if not np.isnan(mae_improvement_pct) else np.nan:.2f}%"
+        )
 
         model_type = _model_type(best_model["Model"]) if (enable_ml or enable_prophet) else None
         recommended_rows.append({
@@ -3820,6 +4363,8 @@ def main():
             "recommended_abs_bias_pct": summary_row.get("recommended_abs_bias_pct"),
             "used_bias_override": summary_row.get("used_bias_override"),
         })
+        regressor_coef = best_model.get("Regressor_coef", best_model.get("Regressor_Coef", np.nan))
+        regressor_pvalue = best_model.get("Regressor_pvalue", best_model.get("Regressor_Pvalue", np.nan))
         results_rows.append({
             "Product": prod,
             "Division": div,
@@ -3839,8 +4384,8 @@ def main():
             "MAE_Improvement_Pct": mae_improvement_pct,
             "Regressor_Name": regressor_name,
             "Regressor_Lag": regressor_lag,
-            "Regressor_Coef": best_model["Regressor_coef"],
-            "Regressor_pvalue": best_model["Regressor_pvalue"],
+            "Regressor_Coef": regressor_coef,
+            "Regressor_pvalue": regressor_pvalue,
             "Baseline_AIC": baseline["AIC"] if baseline is not None else np.nan,
             "Baseline_BIC": baseline["BIC"] if baseline is not None else np.nan,
             "Chosen_AIC": chosen_aic,
@@ -3849,6 +4394,15 @@ def main():
         })
 
         ranking_rows_all.extend(ranking_rows)
+        print(format_sku_summary(
+            idx,
+            total_skus,
+            prod,
+            div,
+            ran=models_ran,
+            skipped=models_skipped,
+            chosen=best_model["Model"],
+        ))
 
     # ===========================
     # 4. EXPORT RESULTS
@@ -3931,6 +4485,10 @@ def main():
             df_rankings.to_excel(writer, index=False, sheet_name="Model_Rankings")
         if not holdout_ts.empty:
             holdout_ts.to_excel(writer, index=False, sheet_name=HOLDOUT_TS_SHEET)
+        if blend_weight_rows_all:
+            pd.DataFrame(blend_weight_rows_all).to_excel(
+                writer, index=False, sheet_name="Blended_Softmax_Weights"
+            )
         if skipped_no_order:
             pd.DataFrame(skipped_no_order).to_excel(
                 writer, index=False, sheet_name="Skipped_No_Order"
