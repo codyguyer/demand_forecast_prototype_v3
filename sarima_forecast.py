@@ -1,10 +1,13 @@
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message="Mean of empty slice", category=RuntimeWarning)
 
 import ast
+import io
 import os
 import time
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,18 +37,20 @@ except Exception:
 BASE_DIR = Path(__file__).resolve().parent
 SALESFORCE_DATA_DIR = BASE_DIR / "salesforce_data"
 
-INPUT_FILE = "all_products_actuals_and_bookings.xlsx"
-REVISED_ACTUALS_FILE = "all_products_actuals_and_bookings_revised.xlsx"
+INPUT_FILE = BASE_DIR / "all_products_actuals_and_bookings.xlsx"
+REVISED_ACTUALS_FILE = BASE_DIR / "all_products_actuals_and_bookings_revised.xlsx"
 REVISED_ACTUALS_SHEET = "Revised Actuals"
-SUMMARY_FILE = "sarima_multi_sku_summary.xlsx"          # chosen model per SKU
-ORDER_FILE = "sarimax_order_search_summary.xlsx"        # chosen (p,d,q)(P,D,Q,s) per SKU
-NOTES_FILE = "Notes.xlsx"                               # manual order overrides
-OUTPUT_FILE_BASE = "stats_model_forecasts.xlsx"
+SUMMARY_FILE = BASE_DIR / "sarima_multi_sku_summary.xlsx"          # chosen model per SKU
+ORDER_FILE = BASE_DIR / "sarimax_order_search_summary.xlsx"        # chosen (p,d,q)(P,D,Q,s) per SKU
+NOTES_FILE = BASE_DIR / "Notes.xlsx"                               # manual order overrides
+OUTPUT_FILE_BASE = BASE_DIR / "stats_model_forecasts.xlsx"
 # If a chosen regressor has lag 0, we fall back to baseline (no exog).
 # If future exogenous values are missing, we do NOT fill; the SKU will fall back to baseline instead.
 FILL_MISSING_FUTURE_EXOG_WITH_LAST = True
 ENABLE_ML_CHALLENGER = True
 ENABLE_PROPHET_CHALLENGER = True
+QUIET_MODEL_OUTPUT = True
+QUIET_MODEL_WARNINGS = True
 PIPELINE_FILES = sorted(SALESFORCE_DATA_DIR.glob("Merged Salesforce Pipeline *.xlsx"))
 SUMMARY_REPORT_NAME = "Salesforce Pipeline Monthly Summary.xlsx"
 SUMMARY_PATH = SALESFORCE_DATA_DIR / SUMMARY_REPORT_NAME
@@ -80,34 +85,75 @@ ROCV_MAX_ORIGINS = 12
 EPSILON_IMPROVEMENT_ABS = 10.0
 IMPROVEMENT_PCT = 0.05
 ROCV_TOLERANCE_PCT = 0.10
+SBA_ALPHA = 0.1
+BLEND_SOFTMAX_TAU = 0.10
+BLEND_EPS = 1e-9
+BLEND_MODEL_NAME = "BLENDED_SOFTMAX"
+HOLDOUT_TS_CSV = BASE_DIR / "data_storage" / "holdout_forecast_actuals.csv"
+OUTPUT_ONLY_WINNING_AND_BLEND = True
 
 # Labels for outward-facing model descriptions
 MODEL_LABELS = {
     "baseline_sarima": "Seasonal Baseline",
     "baseline_ets": "ETS Baseline",
+    "sba": "SBA",
     "ml_gbr": "ML GBR",
     "ml_gbr_pipeline": "ML GBR Pipeline",
     "prophet": "PROPHET",
+    BLEND_MODEL_NAME: "Blended (Softmax)",
+}
+
+# Plain-language model descriptions for output storytelling.
+MODEL_DESCRIPTIONS = {
+    "baseline_sarima": "Repeats stable seasonal patterns from history; best when seasonality holds.",
+    "baseline_ets": "Smooths recent level and trend; best for steady demand with gradual change.",
+    "sba": "Designed for intermittent demand with long gaps between orders.",
+    "with_regressor": "Uses an external driver to adjust the seasonal forecast; shines when the driver leads demand.",
+    "ml_gbr": "Learns patterns from recent history; useful when demand shifts in non-linear ways.",
+    "ml_gbr_pipeline": "Learns patterns from history and pipeline signals; best when pipeline leads demand.",
+    "prophet": "Captures trend shifts and seasonality; useful when growth or decline changes over time.",
+}
+
+FAMILY_STORY_SNIPPETS = {
+    "SARIMA": "seasonal baselines",
+    "SARIMAX": "seasonality plus drivers",
+    "ETS": "smooth trends",
+    "SBA": "intermittent demand",
+    "ML": "pattern learning",
+    "PROPHET": "trend shifts",
 }
 
 
-def _build_output_filename(base_name: str, first_forecast_dt: Optional[pd.Timestamp]) -> str:
+def _build_output_filename(base_name: Union[str, Path], first_forecast_dt: Optional[pd.Timestamp]) -> Path:
     """Append YYYY-Mon suffix to the base filename using first forecast month."""
+    base_path = Path(base_name)
     if first_forecast_dt is None or pd.isna(first_forecast_dt):
-        return base_name
+        return base_path
     try:
         suffix = first_forecast_dt.strftime("%Y-%b")
     except Exception:
-        return base_name
-    if "." in base_name:
-        stem, ext = base_name.rsplit(".", 1)
-        return f"{stem}_{suffix}.{ext}"
-    return f"{base_name}_{suffix}"
+        return base_path
+    if base_path.suffix:
+        return base_path.with_name(f"{base_path.stem}_{suffix}{base_path.suffix}")
+    return base_path.with_name(f"{base_path.name}_{suffix}")
 
 
 # ===========================
 # HELPERS
 # ===========================
+
+@contextmanager
+def quiet_output(enabled: bool = True):
+    if not enabled:
+        yield
+        return
+    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        yield
+
+
+def warn_log(message: str):
+    if not QUIET_MODEL_WARNINGS:
+        print(message)
 
 def aggregate_monthly_duplicates(
     df: pd.DataFrame,
@@ -250,6 +296,145 @@ def safe_nanmean(values: List[Optional[Union[float, int]]]) -> float:
     if np.isnan(arr).all():
         return np.nan
     return float(np.nanmean(arr))
+
+
+def compute_wape(actual, forecast, eps: float = BLEND_EPS) -> float:
+    """Weighted absolute percentage error using absolute-actuals denominator."""
+    actual = np.asarray(actual, dtype=float)
+    forecast = np.asarray(forecast, dtype=float)
+    mask = np.isfinite(actual) & np.isfinite(forecast)
+    if not mask.any():
+        return np.nan
+    denom = np.sum(np.abs(actual[mask]))
+    if denom <= eps:
+        return np.nan
+    return float(np.sum(np.abs(actual[mask] - forecast[mask])) / denom)
+
+
+def _blend_family_from_holdout(model_name: str) -> Optional[str]:
+    if model_name == "SARIMA_baseline":
+        return "SARIMA"
+    if model_name.startswith("SARIMAX"):
+        return "SARIMAX"
+    if model_name == "ETS_baseline":
+        return "ETS"
+    if model_name == "SBA":
+        return "SBA"
+    if model_name == "PROPHET":
+        return "PROPHET"
+    if model_name in {"ML_GBR", PIPELINE_ML_MODEL_NAME}:
+        return "ML"
+    return None
+
+
+def _softmax_weights_from_wape(wape_by_family: Dict[str, float], tau: float) -> Dict[str, float]:
+    if not wape_by_family:
+        return {}
+    finite = {k: v for k, v in wape_by_family.items() if np.isfinite(v)}
+    if not finite:
+        return {}
+    best = min(finite.values())
+    denom = max(best, BLEND_EPS)
+    weights = {}
+    for fam, wape in finite.items():
+        gap = (wape - best) / denom
+        weights[fam] = float(np.exp(-gap / max(tau, BLEND_EPS)))
+    total = sum(weights.values())
+    if total <= BLEND_EPS:
+        return {}
+    return {fam: w / total for fam, w in weights.items()}
+
+
+def _add_holdout_horizon(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"])
+    df["Horizon"] = (
+        df.groupby([COL_PRODUCT, COL_DIVISION])["Date"]
+        .rank(method="dense")
+        .astype(int)
+    )
+    return df
+
+
+def _load_holdout_ts() -> pd.DataFrame:
+    if HOLDOUT_TS_CSV.exists():
+        return pd.read_csv(HOLDOUT_TS_CSV)
+    return pd.DataFrame()
+
+
+def _compute_holdout_weights(
+    holdout_df: pd.DataFrame,
+    product_id: str,
+    bu_id: str,
+    tau: float = BLEND_SOFTMAX_TAU,
+) -> Tuple[Dict[int, Dict[str, float]], Dict[str, float], List[dict]]:
+    if holdout_df.empty:
+        return {}, {}, []
+
+    prod_norm, div_norm = normalize_key(product_id, bu_id)
+    sku_df = holdout_df.copy()
+    sku_df["_prod_norm"] = sku_df[COL_PRODUCT].apply(normalize_code)
+    sku_df["_div_norm"] = sku_df[COL_DIVISION].apply(normalize_code)
+    sku_df = sku_df[(sku_df["_prod_norm"] == prod_norm) & (sku_df["_div_norm"] == div_norm)].copy()
+    if sku_df.empty:
+        return {}, {}, []
+
+    sku_df = _add_holdout_horizon(sku_df)
+    sku_df["Family"] = sku_df["Model"].apply(_blend_family_from_holdout)
+    sku_df = sku_df[sku_df["Family"].notna()]
+    if sku_df.empty:
+        return {}, {}, []
+
+    # Overall WAPE by family (best model within family).
+    overall_wape = (
+        sku_df.groupby(["Family", "Model"], dropna=False)
+        .apply(lambda g: compute_wape(g["Actual"], g["Forecast"]))
+        .reset_index(name="WAPE")
+    )
+    overall_wape = overall_wape[np.isfinite(overall_wape["WAPE"])]
+    if overall_wape.empty:
+        return {}, {}, []
+
+    best_by_family = (
+        overall_wape.sort_values("WAPE")
+        .groupby("Family", as_index=False)
+        .first()
+    )
+    selected_models = set(best_by_family["Model"].tolist())
+    family_to_model = dict(zip(best_by_family["Family"], best_by_family["Model"]))
+    overall_wape_map = {
+        row["Family"]: row["WAPE"] for _, row in best_by_family.iterrows()
+    }
+    overall_weights = _softmax_weights_from_wape(overall_wape_map, tau)
+
+    weights_by_horizon = {}
+    weight_rows = []
+    sku_selected = sku_df[sku_df["Model"].isin(selected_models)]
+    for horizon, h_df in sku_selected.groupby("Horizon"):
+        wape_by_family = {}
+        for family, g_family in h_df.groupby("Family"):
+            best_wape = compute_wape(g_family["Actual"], g_family["Forecast"])
+            if np.isfinite(best_wape):
+                wape_by_family[family] = best_wape
+        weights = _softmax_weights_from_wape(wape_by_family, tau)
+        if not weights:
+            continue
+        weights_by_horizon[int(horizon)] = weights
+        for family, weight in weights.items():
+            weight_rows.append({
+                COL_PRODUCT: product_id,
+                COL_DIVISION: bu_id,
+                "Horizon": int(horizon),
+                "Model_Family": family,
+                "Model": family_to_model.get(family),
+                "WAPE": wape_by_family.get(family, np.nan),
+                "Weight": weight,
+                "Tau": tau,
+                "Weight_Source": "holdout_horizon",
+            })
+
+    return weights_by_horizon, overall_weights, weight_rows
 
 
 def normalize_code(value: object) -> str:
@@ -1234,6 +1419,8 @@ def _model_group_from_choice(choice: dict) -> Optional[str]:
         return "baseline_sarima"
     if model_name == "ETS_baseline":
         return "baseline_ets"
+    if model_name == "SBA":
+        return "sba"
     if model_name.startswith("SARIMAX"):
         return "with_regressor"
     if model_name == "ML_GBR":
@@ -1242,6 +1429,8 @@ def _model_group_from_choice(choice: dict) -> Optional[str]:
         return "ml_gbr_pipeline"
     if model_name == "PROPHET":
         return "prophet"
+    if model_name == "BLENDED_SOFTMAX":
+        return BLEND_MODEL_NAME
     return None
 
 
@@ -1265,6 +1454,7 @@ def _apply_recommended_model_flags(
             "baseline_sarima",
             "with_regressor",
             "baseline_ets",
+            "sba",
             "ml_gbr_pipeline",
             "ml_gbr",
             "prophet",
@@ -1866,7 +2056,8 @@ def _fit_ets_candidate(y_train: pd.Series, spec: dict, use_state_space: bool):
             seasonal_periods=spec["seasonal_periods"],
             initialization_method="estimated",
         )
-        return model.fit()
+        with quiet_output(QUIET_MODEL_OUTPUT):
+            return model.fit(disp=False)
 
     model = ExponentialSmoothing(
         y_train,
@@ -1876,7 +2067,8 @@ def _fit_ets_candidate(y_train: pd.Series, spec: dict, use_state_space: bool):
         seasonal_periods=spec["seasonal_periods"] if spec["seasonal"] is not None else None,
         initialization_method="estimated",
     )
-    return model.fit(optimized=True)
+    with quiet_output(QUIET_MODEL_OUTPUT):
+        return model.fit(optimized=True, disp=False)
 
 
 def _select_best_ets_model(y_train: pd.Series, allow_seasonal: bool, context: str = ""):
@@ -1890,12 +2082,12 @@ def _select_best_ets_model(y_train: pd.Series, allow_seasonal: bool, context: st
             res = _fit_ets_candidate(y_train, spec, use_state_space=True)
             score = _info_criterion(res)
         except Exception as exc:
-            print(f"[WARN] ETSModel failed ({spec}){context}: {exc}")
+            warn_log(f"[WARN] ETSModel failed ({spec}){context}: {exc}")
             continue
 
         is_stable, reason = _ets_is_stable(res, y_train, steps=FORECAST_HORIZON)
         if not is_stable:
-            print(f"[WARN] ETSModel unstable ({spec}){context}: {reason}")
+            warn_log(f"[WARN] ETSModel unstable ({spec}){context}: {reason}")
             continue
 
         if score < best_score:
@@ -1914,12 +2106,12 @@ def _select_best_ets_model(y_train: pd.Series, allow_seasonal: bool, context: st
             res = _fit_ets_candidate(y_train, spec, use_state_space=False)
             score = _info_criterion(res)
         except Exception as exc:
-            print(f"[WARN] ExponentialSmoothing failed ({spec}){context}: {exc}")
+            warn_log(f"[WARN] ExponentialSmoothing failed ({spec}){context}: {exc}")
             continue
 
         is_stable, reason = _ets_is_stable(res, y_train, steps=FORECAST_HORIZON)
         if not is_stable:
-            print(f"[WARN] ExponentialSmoothing unstable ({spec}){context}: {reason}")
+            warn_log(f"[WARN] ExponentialSmoothing unstable ({spec}){context}: {reason}")
             continue
 
         if score < best_score:
@@ -2109,7 +2301,8 @@ def _fit_variant(y_train: pd.Series,
         enforce_stationarity=False,
         enforce_invertibility=False,
     )
-    res = model.fit(disp=False)
+    with quiet_output(QUIET_MODEL_OUTPUT):
+        res = model.fit(disp=False)
     forecast = res.get_forecast(steps=len(forecast_index), exog=exog_future)
     mean = forecast.predicted_mean
     ci = forecast.conf_int(alpha=0.05)
@@ -2132,6 +2325,32 @@ def _safe_rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     if not mask.any():
         return np.nan
     return float(np.sqrt(np.mean((y_true[mask] - y_pred[mask]) ** 2)))
+
+
+def _sba_forecast_value(y_train: pd.Series, alpha: float = SBA_ALPHA) -> float:
+    """Compute SBA forecast level for intermittent demand."""
+    y = pd.Series(y_train).astype(float).dropna()
+    if y.empty:
+        return np.nan
+
+    z = None
+    p = None
+    q = 0.0
+    for demand in y.values:
+        q += 1.0
+        if demand > 0:
+            if z is None:
+                z = float(demand)
+                p = float(q)
+            else:
+                z = z + alpha * (float(demand) - z)
+                p = p + alpha * (q - p)
+            q = 0.0
+
+    if z is None or p is None or p == 0:
+        return 0.0
+
+    return float((1.0 - alpha / 2.0) * (z / p))
 
 
 def _compute_test_window(history_months: int) -> int:
@@ -2183,14 +2402,15 @@ def _evaluate_sarima_metrics(
             return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
 
     try:
-        res = SARIMAX(
-            y_train,
-            exog=exog_train,
-            order=order,
-            seasonal_order=seasonal_order,
-            enforce_stationarity=False,
-            enforce_invertibility=False,
-        ).fit(disp=False)
+        with quiet_output(QUIET_MODEL_OUTPUT):
+            res = SARIMAX(
+                y_train,
+                exog=exog_train,
+                order=order,
+                seasonal_order=seasonal_order,
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            ).fit(disp=False)
         y_pred = _sarimax_forecast_series(res, steps=test_window, exog_future=exog_test)
     except Exception:
         return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
@@ -2212,14 +2432,15 @@ def _evaluate_sarima_metrics(
             if exog_train_rocv.isna().any().any() or exog_test_rocv.isna().any().any():
                 continue
         try:
-            res_rocv = SARIMAX(
-                y_train_rocv,
-                exog=exog_train_rocv,
-                order=order,
-                seasonal_order=seasonal_order,
-                enforce_stationarity=False,
-                enforce_invertibility=False,
-            ).fit(disp=False)
+            with quiet_output(QUIET_MODEL_OUTPUT):
+                res_rocv = SARIMAX(
+                    y_train_rocv,
+                    exog=exog_train_rocv,
+                    order=order,
+                    seasonal_order=seasonal_order,
+                    enforce_stationarity=False,
+                    enforce_invertibility=False,
+                ).fit(disp=False)
             y_pred_rocv = _sarimax_forecast_series(res_rocv, steps=rocv_horizon, exog_future=exog_test_rocv)
             mae = _safe_mae(y_test_rocv.values, y_pred_rocv.values)
             if np.isfinite(mae):
@@ -2277,6 +2498,43 @@ def _evaluate_ets_metrics(
     return {"Test_MAE": test_mae, "Test_RMSE": test_rmse, "ROCV_MAE": rocv_mae}
 
 
+def _evaluate_sba_metrics(
+    y: pd.Series,
+    test_window: int,
+    alpha: float = SBA_ALPHA,
+    rocv_horizon: int = ROCV_HORIZON,
+    rocv_max_origins: int = ROCV_MAX_ORIGINS,
+) -> dict:
+    """Fit SBA, compute test MAE/RMSE and ROCV MAE."""
+    y_clean = y.dropna().astype(float)
+    if len(y_clean) <= test_window:
+        return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
+
+    y_train = y_clean.iloc[:-test_window]
+    y_test = y_clean.iloc[-test_window:]
+
+    forecast_value = _sba_forecast_value(y_train, alpha=alpha)
+    y_pred = pd.Series(np.repeat(forecast_value, len(y_test)), index=y_test.index)
+
+    test_mae = _safe_mae(y_test.values, y_pred.values)
+    test_rmse = _safe_rmse(y_test.values, y_pred.values)
+
+    rocv_maes = []
+    min_train = max(12, rocv_horizon)
+    origins = _rocv_origins(len(y_clean), rocv_horizon, rocv_max_origins, min_train)
+    for origin in origins:
+        y_train_rocv = y_clean.iloc[:origin]
+        y_test_rocv = y_clean.iloc[origin:origin + rocv_horizon]
+        forecast_value = _sba_forecast_value(y_train_rocv, alpha=alpha)
+        y_pred_rocv = np.repeat(forecast_value, len(y_test_rocv))
+        mae = _safe_mae(y_test_rocv.values, y_pred_rocv)
+        if np.isfinite(mae):
+            rocv_maes.append(mae)
+
+    rocv_mae = float(np.mean(rocv_maes)) if rocv_maes else np.nan
+    return {"Test_MAE": test_mae, "Test_RMSE": test_rmse, "ROCV_MAE": rocv_mae}
+
+
 def _accept_candidate(
     candidate: dict,
     baseline: dict,
@@ -2319,6 +2577,7 @@ def _recommend_model_group(
     allow_sarimax: bool,
     allow_ets_for_reco: bool,
     allow_ets_seasonal: bool,
+    allow_sba: bool,
     allow_ml: bool,
     allow_prophet: bool,
 ) -> Optional[str]:
@@ -2357,6 +2616,13 @@ def _recommend_model_group(
         )
         ets_metrics["model_group"] = "baseline_ets"
         metrics.append(ets_metrics)
+
+    if allow_sba:
+        sba_metrics = _evaluate_sba_metrics(
+            y_clean, test_window, alpha=SBA_ALPHA
+        )
+        sba_metrics["model_group"] = "sba"
+        metrics.append(sba_metrics)
 
     if allow_ml:
         ml_metrics = _evaluate_ml_metrics(
@@ -2406,6 +2672,7 @@ def generate_forecast_variants(
     allow_sarimax: bool = True,
     allow_ets: bool = True,
     allow_ets_seasonal: bool = True,
+    allow_sba: bool = True,
     allow_ml: bool = True,
     allow_prophet: bool = True,
     status_reasons: Optional[Dict[str, str]] = None,
@@ -2457,11 +2724,6 @@ def generate_forecast_variants(
             "model_status_reason": reason,
         })
         return df_na
-
-    def _attach_status(df: pd.DataFrame, status: str, reason: str = "") -> pd.DataFrame:
-        df["model_status"] = status
-        df["model_status_reason"] = reason
-        return df
 
     # Seasonal baseline
     if not allow_sarima:
@@ -2545,6 +2807,45 @@ def generate_forecast_variants(
                 "baseline_ets",
                 "ETS",
                 _natural_model_label("baseline_ets"),
+                f"Failed: {exc}",
+                status="Failed",
+            ))
+
+    # SBA (Syntetos-Boylan Approximation)
+    if not allow_sba:
+        reason = status_reasons.get("sba", "N/A: SBA disabled.")
+        dfs.append(_build_na_rows("sba", "SBA", _natural_model_label("sba"), reason))
+    else:
+        try:
+            y_train = y.dropna()
+            if y_train.empty:
+                raise ValueError("No non-null history for SBA.")
+            forecast_value = _sba_forecast_value(y_train, alpha=SBA_ALPHA)
+            sba_df = pd.DataFrame({
+                "forecast_month": forecast_index,
+                "forecast_value": [forecast_value] * len(forecast_index),
+                "lower_ci": [np.nan] * len(forecast_index),
+                "upper_ci": [np.nan] * len(forecast_index),
+                "model_group": "sba",
+                "model_type": "SBA",
+                "model_label": _natural_model_label("sba"),
+                "p": np.nan,
+                "d": np.nan,
+                "q": np.nan,
+                "P": np.nan,
+                "D": np.nan,
+                "Q": np.nan,
+                "s": np.nan,
+                "regressor_names": None,
+                "regressor_details": None,
+            })
+            dfs.append(_attach_status(_apply_forecast_floor(sba_df), "ok"))
+        except Exception as exc:
+            print(f"  Failed SBA: {exc}")
+            dfs.append(_build_na_rows(
+                "sba",
+                "SBA",
+                _natural_model_label("sba"),
                 f"Failed: {exc}",
                 status="Failed",
             ))
@@ -2839,6 +3140,152 @@ def _apply_forecast_floor(df: pd.DataFrame, floor: float = FORECAST_FLOOR) -> pd
     return df
 
 
+def _attach_status(df: pd.DataFrame, status: str, reason: str = "") -> pd.DataFrame:
+    df["model_status"] = status
+    df["model_status_reason"] = reason
+    return df
+
+
+def _blend_description(top_families_raw: Optional[str]) -> str:
+    if not top_families_raw:
+        return "Weighted blend of the best-performing models based on recent accuracy."
+    families = [fam.strip() for fam in str(top_families_raw).split(",") if fam.strip()]
+    if not families:
+        return "Weighted blend of the best-performing models based on recent accuracy."
+    if len(families) == 1:
+        snippet = FAMILY_STORY_SNIPPETS.get(families[0], "their strengths")
+        return f"Weighted blend leaning toward {families[0]}; balances {snippet} based on recent accuracy."
+    first, second = families[0], families[1]
+    snippet_first = FAMILY_STORY_SNIPPETS.get(first, "their strengths")
+    snippet_second = FAMILY_STORY_SNIPPETS.get(second, "their strengths")
+    return (
+        f"Weighted blend leaning toward {first} and {second}; "
+        f"balances {snippet_first} and {snippet_second} based on recent accuracy."
+    )
+
+
+def _build_forecast_description(row: pd.Series) -> str:
+    model_group = row.get("model_group")
+    if model_group == BLEND_MODEL_NAME:
+        return _blend_description(row.get("blend_top_families"))
+    return MODEL_DESCRIPTIONS.get(model_group, "")
+
+
+def _build_blended_softmax_forecast(
+    fc_df: pd.DataFrame,
+    product_id: str,
+    bu_id: str,
+    weights_by_horizon: Dict[int, Dict[str, float]],
+    overall_weights: Dict[str, float],
+    weight_rows_holdout: List[dict],
+) -> Tuple[pd.DataFrame, List[dict]]:
+    if fc_df.empty:
+        return pd.DataFrame(), []
+
+    family_by_group = {
+        "baseline_sarima": "SARIMA",
+        "with_regressor": "SARIMAX",
+        "baseline_ets": "ETS",
+        "sba": "SBA",
+        "prophet": "PROPHET",
+        "ml_gbr": "ML",
+        "ml_gbr_pipeline": "ML",
+    }
+    fc_ok = fc_df[fc_df["model_status"] == "ok"].copy()
+    fc_ok = fc_ok[fc_ok["model_group"].isin(family_by_group)]
+    if fc_ok.empty:
+        return pd.DataFrame(), []
+
+    fc_ok["family"] = fc_ok["model_group"].map(family_by_group)
+    fc_ok["horizon"] = fc_ok["horizon_months_ahead"].astype(int)
+
+    forecast_map = {}
+    for (family, horizon), group in fc_ok.groupby(["family", "horizon"]):
+        forecast_map[(family, horizon)] = float(group["forecast_value"].iloc[0])
+
+    weight_rows = list(weight_rows_holdout)
+    wape_lookup = {
+        (int(row["Horizon"]), row["Model_Family"]): row.get("WAPE", np.nan)
+        for row in weight_rows_holdout
+        if "Horizon" in row and "Model_Family" in row
+    }
+    existing_keys = set(wape_lookup.keys())
+
+    blended_rows = []
+    horizons = sorted(fc_ok["horizon"].unique())
+    families = sorted(fc_ok["family"].unique())
+    for horizon in horizons:
+        weights = weights_by_horizon.get(horizon)
+        source = "holdout_horizon"
+        if not weights:
+            weights = overall_weights
+            source = "holdout_overall"
+        if not weights:
+            equal = 1.0 / len(families) if families else 0.0
+            weights = {family: equal for family in families}
+            source = "equal_fallback"
+
+        total = 0.0
+        weight_sum = 0.0
+        weight_items = list(weights.items()) if weights else []
+        weight_items = sorted(weight_items, key=lambda item: (-item[1], item[0]))
+        top_families = [family for family, _ in weight_items[:2]]
+        for family, weight in weights.items():
+            fc_val = forecast_map.get((family, horizon))
+            if fc_val is None or not np.isfinite(fc_val):
+                continue
+            total += weight * fc_val
+            weight_sum += weight
+            key = (horizon, family)
+            if source != "holdout_horizon" or key not in existing_keys:
+                weight_rows.append({
+                    COL_PRODUCT: product_id,
+                    COL_DIVISION: bu_id,
+                    "Horizon": horizon,
+                    "Model_Family": family,
+                    "WAPE": wape_lookup.get(key, np.nan),
+                    "Weight": weight,
+                    "Tau": BLEND_SOFTMAX_TAU,
+                    "Weight_Source": source,
+                })
+        if weight_sum <= BLEND_EPS:
+            continue
+        blended_rows.append({
+            "forecast_month": fc_ok.loc[fc_ok["horizon"] == horizon, "forecast_month"].iloc[0],
+            "forecast_value": total / weight_sum,
+            "lower_ci": np.nan,
+            "upper_ci": np.nan,
+            "model_group": BLEND_MODEL_NAME,
+            "model_type": "BLEND",
+            "model_label": _natural_model_label(BLEND_MODEL_NAME),
+            "blend_top_families": ", ".join(top_families),
+            "p": np.nan,
+            "d": np.nan,
+            "q": np.nan,
+            "P": np.nan,
+            "D": np.nan,
+            "Q": np.nan,
+            "s": np.nan,
+            "regressor_names": None,
+            "regressor_details": None,
+        })
+
+    blended_df = pd.DataFrame(blended_rows)
+    if blended_df.empty:
+        return pd.DataFrame(), weight_rows
+
+    blended_df["product_id"] = product_id
+    blended_df["bu_id"] = bu_id
+    blended_df["run_id"] = fc_df["run_id"].iloc[0]
+    blended_df["training_start"] = fc_df["training_start"].iloc[0]
+    blended_df["training_end"] = fc_df["training_end"].iloc[0]
+    blended_df["horizon_months_ahead"] = (
+        blended_df.groupby(["product_id", "model_group"]).cumcount() + 1
+    )
+    blended_df = _attach_status(_apply_forecast_floor(blended_df), "ok")
+    return blended_df, weight_rows
+
+
 # ===========================
 # MAIN
 # ===========================
@@ -2852,16 +3299,16 @@ def _print_total_runtime(start_time: float) -> None:
 
 def main():
     if ENABLE_ML_CHALLENGER:
-        print("ML challenger enabled — evaluating ML_GBR candidate.")
+        print("ML challenger enabled - evaluating ML_GBR candidate.")
     else:
-        print("ML challenger disabled (ENABLE_ML_CHALLENGER=False) — skipping ML candidate evaluation.")
+        print("ML challenger disabled (ENABLE_ML_CHALLENGER=False) - skipping ML candidate evaluation.")
     if ENABLE_PROPHET_CHALLENGER:
         if PROPHET_AVAILABLE:
-            print("Prophet challenger enabled — evaluating PROPHET candidate.")
+            print("Prophet challenger enabled - evaluating PROPHET candidate.")
         else:
             print("Prophet not installed; skipping Prophet challenger.")
     else:
-        print("Prophet challenger disabled (ENABLE_PROPHET_CHALLENGER=False) — skipping Prophet candidate evaluation.")
+        print("Prophet challenger disabled (ENABLE_PROPHET_CHALLENGER=False) - skipping Prophet candidate evaluation.")
 
     print("Loading data...")
     df_all = pd.read_excel(INPUT_FILE)
@@ -2874,11 +3321,13 @@ def main():
         output_excel_path=REVISED_ACTUALS_FILE,
         output_sheet=REVISED_ACTUALS_SHEET,
     )
+    holdout_ts_all = _load_holdout_ts()
+    blend_weight_rows_all = []
     summary_full = pd.DataFrame()
     if SUMMARY_PATH.exists():
         summary_full = load_summary_report(SUMMARY_PATH)
     else:
-        print(f"[WARN] Summary file not found: {SUMMARY_PATH}")
+        warn_log(f"[WARN] Summary file not found: {SUMMARY_PATH}")
     df_all = merge_summary_regressors(df_all, summary_full)
     df_all[COL_DATE] = pd.to_datetime(df_all[COL_DATE])
     df_all = df_all.sort_values([COL_PRODUCT, COL_DIVISION, COL_DATE])
@@ -2953,10 +3402,11 @@ def main():
 
     results_rows = []
     sku_groups = df_all.groupby([COL_PRODUCT, COL_DIVISION], dropna=False)
-    print(f"Found {len(sku_groups)} product+division combinations.")
+    total_skus = len(sku_groups)
+    print(f"Found {total_skus} product+division combinations.")
 
-    for (prod, div), df_sku in sku_groups:
-        print(f"\n=== {prod} / {div} ===")
+    for idx, ((prod, div), df_sku) in enumerate(sku_groups, start=1):
+        print(f"\n=== [{idx}/{total_skus}] {prod} / {div} ===")
         key = normalize_key(prod, div)
         choice = model_choices.get(key)
         order_pair = orders_map.get(key)
@@ -3089,6 +3539,25 @@ def main():
             print("  No forecasts generated for this SKU (all variants failed).")
             continue
 
+        weights_by_horizon, overall_weights, weight_rows = _compute_holdout_weights(
+            holdout_ts_all,
+            prod,
+            div,
+            tau=BLEND_SOFTMAX_TAU,
+        )
+        if weights_by_horizon or overall_weights:
+            blended_df, weight_rows_used = _build_blended_softmax_forecast(
+                fc_df,
+                prod,
+                div,
+                weights_by_horizon,
+                overall_weights,
+                weight_rows,
+            )
+            if not blended_df.empty:
+                fc_df = pd.concat([fc_df, blended_df], ignore_index=True)
+                blend_weight_rows_all.extend(weight_rows_used)
+
         recommended_group = _model_group_from_choice(choice)
         fc_df = _apply_recommended_model_flags(fc_df, recommended_group)
 
@@ -3101,6 +3570,12 @@ def main():
 
     all_forecasts = pd.concat(results_rows, axis=0, ignore_index=True)
     all_forecasts = _apply_recommended_flags_all(all_forecasts, model_choices)
+    if OUTPUT_ONLY_WINNING_AND_BLEND and "recommended_model" in all_forecasts.columns:
+        all_forecasts = all_forecasts[
+            (all_forecasts["recommended_model"])
+            | (all_forecasts["model_group"] == BLEND_MODEL_NAME)
+        ].copy()
+    all_forecasts["forecast_description"] = all_forecasts.apply(_build_forecast_description, axis=1)
     # Format forecast_month for Excel as MM/DD/YYYY to avoid time components
     all_forecasts["forecast_month"] = pd.to_datetime(all_forecasts["forecast_month"]).dt.strftime("%m/%d/%Y")
 
@@ -3117,10 +3592,21 @@ def main():
     )
     all_forecasts.insert(0, "product_bu_forecast_month_model_type", key_col)
 
+    drop_cols = {"lower_ci", "upper_ci", "model_group", "model_label", "blend_top_families"}
+    present_drop_cols = [col for col in drop_cols if col in all_forecasts.columns]
+    if present_drop_cols:
+        all_forecasts = all_forecasts.drop(columns=present_drop_cols)
+
+    if "forecast_description" in all_forecasts.columns:
+        ordered_cols = [col for col in all_forecasts.columns if col != "forecast_description"]
+        ordered_cols.append("forecast_description")
+        all_forecasts = all_forecasts[ordered_cols]
+
     print("\nWriting combined forecasts...")
     first_fc_dt = pd.to_datetime(all_forecasts["forecast_month"]).min()
     output_file = _build_output_filename(OUTPUT_FILE_BASE, first_fc_dt)
-    all_forecasts.to_excel(output_file, index=False, sheet_name="Forecast_Library")
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        all_forecasts.to_excel(writer, index=False, sheet_name="Forecast_Library")
     print(f"Done. Saved to {output_file}")
 
 

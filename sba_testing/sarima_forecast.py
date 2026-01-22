@@ -1,10 +1,13 @@
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message="Mean of empty slice", category=RuntimeWarning)
 
 import ast
+import io
 import os
 import time
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,21 +36,21 @@ except Exception:
 
 BASE_DIR = Path(__file__).resolve().parent
 SALESFORCE_DATA_DIR = BASE_DIR / "salesforce_data"
-if not SALESFORCE_DATA_DIR.exists():
-    SALESFORCE_DATA_DIR = BASE_DIR.parent / "salesforce_data"
 
-INPUT_FILE = "all_products_actuals_and_bookings.xlsx"
-REVISED_ACTUALS_FILE = "all_products_actuals_and_bookings_revised.xlsx"
+INPUT_FILE = BASE_DIR / "all_products_actuals_and_bookings.xlsx"
+REVISED_ACTUALS_FILE = BASE_DIR / "all_products_actuals_and_bookings_revised.xlsx"
 REVISED_ACTUALS_SHEET = "Revised Actuals"
-SUMMARY_FILE = "sarima_multi_sku_summary.xlsx"          # chosen model per SKU
-ORDER_FILE = "sarimax_order_search_summary.xlsx"        # chosen (p,d,q)(P,D,Q,s) per SKU
-NOTES_FILE = "Notes.xlsx"                               # manual order overrides
-OUTPUT_FILE_BASE = "stats_model_forecasts.xlsx"
+SUMMARY_FILE = BASE_DIR / "sarima_multi_sku_summary.xlsx"          # chosen model per SKU
+ORDER_FILE = BASE_DIR / "sarimax_order_search_summary.xlsx"        # chosen (p,d,q)(P,D,Q,s) per SKU
+NOTES_FILE = BASE_DIR / "Notes.xlsx"                               # manual order overrides
+OUTPUT_FILE_BASE = BASE_DIR / "stats_model_forecasts.xlsx"
 # If a chosen regressor has lag 0, we fall back to baseline (no exog).
 # If future exogenous values are missing, we do NOT fill; the SKU will fall back to baseline instead.
 FILL_MISSING_FUTURE_EXOG_WITH_LAST = True
 ENABLE_ML_CHALLENGER = True
 ENABLE_PROPHET_CHALLENGER = True
+QUIET_MODEL_OUTPUT = True
+QUIET_MODEL_WARNINGS = True
 PIPELINE_FILES = sorted(SALESFORCE_DATA_DIR.glob("Merged Salesforce Pipeline *.xlsx"))
 SUMMARY_REPORT_NAME = "Salesforce Pipeline Monthly Summary.xlsx"
 SUMMARY_PATH = SALESFORCE_DATA_DIR / SUMMARY_REPORT_NAME
@@ -87,6 +90,7 @@ BLEND_SOFTMAX_TAU = 0.10
 BLEND_EPS = 1e-9
 BLEND_MODEL_NAME = "blended_softmax"
 HOLDOUT_TS_CSV = BASE_DIR / "data_storage" / "holdout_forecast_actuals.csv"
+OUTPUT_ONLY_WINNING_AND_BLEND = True
 
 # Labels for outward-facing model descriptions
 MODEL_LABELS = {
@@ -99,24 +103,57 @@ MODEL_LABELS = {
     BLEND_MODEL_NAME: "Blended (Softmax)",
 }
 
+# Plain-language model descriptions for output storytelling.
+MODEL_DESCRIPTIONS = {
+    "baseline_sarima": "Repeats stable seasonal patterns from history; best when seasonality holds.",
+    "baseline_ets": "Smooths recent level and trend; best for steady demand with gradual change.",
+    "sba": "Designed for intermittent demand with long gaps between orders.",
+    "with_regressor": "Uses an external driver to adjust the seasonal forecast; shines when the driver leads demand.",
+    "ml_gbr": "Learns patterns from recent history; useful when demand shifts in non-linear ways.",
+    "ml_gbr_pipeline": "Learns patterns from history and pipeline signals; best when pipeline leads demand.",
+    "prophet": "Captures trend shifts and seasonality; useful when growth or decline changes over time.",
+}
 
-def _build_output_filename(base_name: str, first_forecast_dt: Optional[pd.Timestamp]) -> str:
+FAMILY_STORY_SNIPPETS = {
+    "SARIMA": "seasonal baselines",
+    "SARIMAX": "seasonality plus drivers",
+    "ETS": "smooth trends",
+    "SBA": "intermittent demand",
+    "ML": "pattern learning",
+    "PROPHET": "trend shifts",
+}
+
+
+def _build_output_filename(base_name: Union[str, Path], first_forecast_dt: Optional[pd.Timestamp]) -> Path:
     """Append YYYY-Mon suffix to the base filename using first forecast month."""
+    base_path = Path(base_name)
     if first_forecast_dt is None or pd.isna(first_forecast_dt):
-        return base_name
+        return base_path
     try:
         suffix = first_forecast_dt.strftime("%Y-%b")
     except Exception:
-        return base_name
-    if "." in base_name:
-        stem, ext = base_name.rsplit(".", 1)
-        return f"{stem}_{suffix}.{ext}"
-    return f"{base_name}_{suffix}"
+        return base_path
+    if base_path.suffix:
+        return base_path.with_name(f"{base_path.stem}_{suffix}{base_path.suffix}")
+    return base_path.with_name(f"{base_path.name}_{suffix}")
 
 
 # ===========================
 # HELPERS
 # ===========================
+
+@contextmanager
+def quiet_output(enabled: bool = True):
+    if not enabled:
+        yield
+        return
+    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        yield
+
+
+def warn_log(message: str):
+    if not QUIET_MODEL_WARNINGS:
+        print(message)
 
 def aggregate_monthly_duplicates(
     df: pd.DataFrame,
@@ -2019,7 +2056,8 @@ def _fit_ets_candidate(y_train: pd.Series, spec: dict, use_state_space: bool):
             seasonal_periods=spec["seasonal_periods"],
             initialization_method="estimated",
         )
-        return model.fit()
+        with quiet_output(QUIET_MODEL_OUTPUT):
+            return model.fit(disp=False)
 
     model = ExponentialSmoothing(
         y_train,
@@ -2029,7 +2067,8 @@ def _fit_ets_candidate(y_train: pd.Series, spec: dict, use_state_space: bool):
         seasonal_periods=spec["seasonal_periods"] if spec["seasonal"] is not None else None,
         initialization_method="estimated",
     )
-    return model.fit(optimized=True)
+    with quiet_output(QUIET_MODEL_OUTPUT):
+        return model.fit(optimized=True, disp=False)
 
 
 def _select_best_ets_model(y_train: pd.Series, allow_seasonal: bool, context: str = ""):
@@ -2043,12 +2082,12 @@ def _select_best_ets_model(y_train: pd.Series, allow_seasonal: bool, context: st
             res = _fit_ets_candidate(y_train, spec, use_state_space=True)
             score = _info_criterion(res)
         except Exception as exc:
-            print(f"[WARN] ETSModel failed ({spec}){context}: {exc}")
+            warn_log(f"[WARN] ETSModel failed ({spec}){context}: {exc}")
             continue
 
         is_stable, reason = _ets_is_stable(res, y_train, steps=FORECAST_HORIZON)
         if not is_stable:
-            print(f"[WARN] ETSModel unstable ({spec}){context}: {reason}")
+            warn_log(f"[WARN] ETSModel unstable ({spec}){context}: {reason}")
             continue
 
         if score < best_score:
@@ -2067,12 +2106,12 @@ def _select_best_ets_model(y_train: pd.Series, allow_seasonal: bool, context: st
             res = _fit_ets_candidate(y_train, spec, use_state_space=False)
             score = _info_criterion(res)
         except Exception as exc:
-            print(f"[WARN] ExponentialSmoothing failed ({spec}){context}: {exc}")
+            warn_log(f"[WARN] ExponentialSmoothing failed ({spec}){context}: {exc}")
             continue
 
         is_stable, reason = _ets_is_stable(res, y_train, steps=FORECAST_HORIZON)
         if not is_stable:
-            print(f"[WARN] ExponentialSmoothing unstable ({spec}){context}: {reason}")
+            warn_log(f"[WARN] ExponentialSmoothing unstable ({spec}){context}: {reason}")
             continue
 
         if score < best_score:
@@ -2262,7 +2301,8 @@ def _fit_variant(y_train: pd.Series,
         enforce_stationarity=False,
         enforce_invertibility=False,
     )
-    res = model.fit(disp=False)
+    with quiet_output(QUIET_MODEL_OUTPUT):
+        res = model.fit(disp=False)
     forecast = res.get_forecast(steps=len(forecast_index), exog=exog_future)
     mean = forecast.predicted_mean
     ci = forecast.conf_int(alpha=0.05)
@@ -2362,14 +2402,15 @@ def _evaluate_sarima_metrics(
             return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
 
     try:
-        res = SARIMAX(
-            y_train,
-            exog=exog_train,
-            order=order,
-            seasonal_order=seasonal_order,
-            enforce_stationarity=False,
-            enforce_invertibility=False,
-        ).fit(disp=False)
+        with quiet_output(QUIET_MODEL_OUTPUT):
+            res = SARIMAX(
+                y_train,
+                exog=exog_train,
+                order=order,
+                seasonal_order=seasonal_order,
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            ).fit(disp=False)
         y_pred = _sarimax_forecast_series(res, steps=test_window, exog_future=exog_test)
     except Exception:
         return {"Test_MAE": np.nan, "Test_RMSE": np.nan, "ROCV_MAE": np.nan}
@@ -2391,14 +2432,15 @@ def _evaluate_sarima_metrics(
             if exog_train_rocv.isna().any().any() or exog_test_rocv.isna().any().any():
                 continue
         try:
-            res_rocv = SARIMAX(
-                y_train_rocv,
-                exog=exog_train_rocv,
-                order=order,
-                seasonal_order=seasonal_order,
-                enforce_stationarity=False,
-                enforce_invertibility=False,
-            ).fit(disp=False)
+            with quiet_output(QUIET_MODEL_OUTPUT):
+                res_rocv = SARIMAX(
+                    y_train_rocv,
+                    exog=exog_train_rocv,
+                    order=order,
+                    seasonal_order=seasonal_order,
+                    enforce_stationarity=False,
+                    enforce_invertibility=False,
+                ).fit(disp=False)
             y_pred_rocv = _sarimax_forecast_series(res_rocv, steps=rocv_horizon, exog_future=exog_test_rocv)
             mae = _safe_mae(y_test_rocv.values, y_pred_rocv.values)
             if np.isfinite(mae):
@@ -2682,11 +2724,6 @@ def generate_forecast_variants(
             "model_status_reason": reason,
         })
         return df_na
-
-    def _attach_status(df: pd.DataFrame, status: str, reason: str = "") -> pd.DataFrame:
-        df["model_status"] = status
-        df["model_status_reason"] = reason
-        return df
 
     # Seasonal baseline
     if not allow_sarima:
@@ -3103,6 +3140,37 @@ def _apply_forecast_floor(df: pd.DataFrame, floor: float = FORECAST_FLOOR) -> pd
     return df
 
 
+def _attach_status(df: pd.DataFrame, status: str, reason: str = "") -> pd.DataFrame:
+    df["model_status"] = status
+    df["model_status_reason"] = reason
+    return df
+
+
+def _blend_description(top_families_raw: Optional[str]) -> str:
+    if not top_families_raw:
+        return "Weighted blend of the best-performing models based on recent accuracy."
+    families = [fam.strip() for fam in str(top_families_raw).split(",") if fam.strip()]
+    if not families:
+        return "Weighted blend of the best-performing models based on recent accuracy."
+    if len(families) == 1:
+        snippet = FAMILY_STORY_SNIPPETS.get(families[0], "their strengths")
+        return f"Weighted blend leaning toward {families[0]}; balances {snippet} based on recent accuracy."
+    first, second = families[0], families[1]
+    snippet_first = FAMILY_STORY_SNIPPETS.get(first, "their strengths")
+    snippet_second = FAMILY_STORY_SNIPPETS.get(second, "their strengths")
+    return (
+        f"Weighted blend leaning toward {first} and {second}; "
+        f"balances {snippet_first} and {snippet_second} based on recent accuracy."
+    )
+
+
+def _build_forecast_description(row: pd.Series) -> str:
+    model_group = row.get("model_group")
+    if model_group == BLEND_MODEL_NAME:
+        return _blend_description(row.get("blend_top_families"))
+    return MODEL_DESCRIPTIONS.get(model_group, "")
+
+
 def _build_blended_softmax_forecast(
     fc_df: pd.DataFrame,
     product_id: str,
@@ -3159,6 +3227,9 @@ def _build_blended_softmax_forecast(
 
         total = 0.0
         weight_sum = 0.0
+        weight_items = list(weights.items()) if weights else []
+        weight_items = sorted(weight_items, key=lambda item: (-item[1], item[0]))
+        top_families = [family for family, _ in weight_items[:2]]
         for family, weight in weights.items():
             fc_val = forecast_map.get((family, horizon))
             if fc_val is None or not np.isfinite(fc_val):
@@ -3187,6 +3258,7 @@ def _build_blended_softmax_forecast(
             "model_group": BLEND_MODEL_NAME,
             "model_type": "BLEND",
             "model_label": _natural_model_label(BLEND_MODEL_NAME),
+            "blend_top_families": ", ".join(top_families),
             "p": np.nan,
             "d": np.nan,
             "q": np.nan,
@@ -3255,7 +3327,7 @@ def main():
     if SUMMARY_PATH.exists():
         summary_full = load_summary_report(SUMMARY_PATH)
     else:
-        print(f"[WARN] Summary file not found: {SUMMARY_PATH}")
+        warn_log(f"[WARN] Summary file not found: {SUMMARY_PATH}")
     df_all = merge_summary_regressors(df_all, summary_full)
     df_all[COL_DATE] = pd.to_datetime(df_all[COL_DATE])
     df_all = df_all.sort_values([COL_PRODUCT, COL_DIVISION, COL_DATE])
@@ -3330,10 +3402,11 @@ def main():
 
     results_rows = []
     sku_groups = df_all.groupby([COL_PRODUCT, COL_DIVISION], dropna=False)
-    print(f"Found {len(sku_groups)} product+division combinations.")
+    total_skus = len(sku_groups)
+    print(f"Found {total_skus} product+division combinations.")
 
-    for (prod, div), df_sku in sku_groups:
-        print(f"\n=== {prod} / {div} ===")
+    for idx, ((prod, div), df_sku) in enumerate(sku_groups, start=1):
+        print(f"\n=== [{idx}/{total_skus}] {prod} / {div} ===")
         key = normalize_key(prod, div)
         choice = model_choices.get(key)
         order_pair = orders_map.get(key)
@@ -3497,6 +3570,12 @@ def main():
 
     all_forecasts = pd.concat(results_rows, axis=0, ignore_index=True)
     all_forecasts = _apply_recommended_flags_all(all_forecasts, model_choices)
+    if OUTPUT_ONLY_WINNING_AND_BLEND and "recommended_model" in all_forecasts.columns:
+        all_forecasts = all_forecasts[
+            (all_forecasts["recommended_model"])
+            | (all_forecasts["model_group"] == BLEND_MODEL_NAME)
+        ].copy()
+    all_forecasts["forecast_description"] = all_forecasts.apply(_build_forecast_description, axis=1)
     # Format forecast_month for Excel as MM/DD/YYYY to avoid time components
     all_forecasts["forecast_month"] = pd.to_datetime(all_forecasts["forecast_month"]).dt.strftime("%m/%d/%Y")
 
@@ -3512,6 +3591,16 @@ def main():
         + all_forecasts["model_type"].astype(str)
     )
     all_forecasts.insert(0, "product_bu_forecast_month_model_type", key_col)
+
+    drop_cols = {"lower_ci", "upper_ci", "model_group", "regressor_names", "blend_top_families"}
+    present_drop_cols = [col for col in drop_cols if col in all_forecasts.columns]
+    if present_drop_cols:
+        all_forecasts = all_forecasts.drop(columns=present_drop_cols)
+
+    if "forecast_description" in all_forecasts.columns:
+        ordered_cols = [col for col in all_forecasts.columns if col != "forecast_description"]
+        ordered_cols.append("forecast_description")
+        all_forecasts = all_forecasts[ordered_cols]
 
     print("\nWriting combined forecasts...")
     first_fc_dt = pd.to_datetime(all_forecasts["forecast_month"]).min()

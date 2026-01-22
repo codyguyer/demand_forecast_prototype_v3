@@ -4,8 +4,8 @@ Python scripts for selecting SARIMA/SARIMAX orders by SKU, evaluating exogenous 
 
 ## Repository contents
 - `sarima_order_selector.py` - grid-searches SARIMA/SARIMAX orders per (Product, Division) with rolling-origin CV and a holdout block; writes `sarimax_order_search_summary.xlsx`.
-- `sarima_multi_sku_engine.py` - uses the chosen orders to compare baseline SARIMA/ETS vs. SARIMAX models with lagged regressors; writes `sarima_multi_sku_summary.xlsx`.
-- `sarima_forecast.py` - builds forecast variants (baseline SARIMA/ETS and SARIMAX if allowed) for each SKU; writes `stats_model_forecasts_YYYY-Mon.xlsx`.
+- `sarima_multi_sku_engine.py` - uses the chosen orders to compare baseline SARIMA/ETS vs. SARIMAX, plus SBA and optional ML/Prophet challengers; writes `sarima_multi_sku_summary.xlsx`.
+- `sarima_forecast.py` - builds forecast variants per SKU, then keeps only the recommended model and the blended softmax forecast; writes `stats_model_forecasts_YYYY-Mon.xlsx`.
 - `generate_forecast_variants.py` - small utility showing how to assemble forecast variants for a given SKU (used as a reference/helper).
 - `compare_model_selection.py` - optional report comparing legacy vs. current selection logic (bias override impacts).
 - `.gitignore` - excludes data files (`*.xlsx`, `*.csv`) and Python build artifacts.
@@ -57,12 +57,12 @@ python sarima_multi_sku_engine.py
    - Outputs `sarima_multi_sku_summary.xlsx`
    - Optional: add `--compare-model-selection` to generate old vs. new selection comparison CSVs in `data_storage/model_selection_eval/`
 
-3) Generate forecast variants:
+3) Generate forecasts:
 ```bash
 python sarima_forecast.py
 ```
    - Reads `all_products_actuals_and_bookings.xlsx`, `sarimax_order_search_summary.xlsx`, and `sarima_multi_sku_summary.xlsx`
-   - Outputs `stats_model_forecasts_YYYY-Mon.xlsx` with a password of "gopackgo"
+   - Outputs `stats_model_forecasts_YYYY-Mon.xlsx`
 
 ## Model logic and assumptions (new analyst guide)
 
@@ -118,7 +118,11 @@ Baseline models:
   - Seasonal period is 12 when seasonal is enabled.
   - Best ETS candidate is chosen by AICc (falls back to AIC).
   - If ETSModel cannot fit any candidate, it falls back to `ExponentialSmoothing` with additive error.
-  - ETS fitting and scoring use non-null history only.
+- ETS fitting and scoring use non-null history only.
+
+SBA challenger:
+- SBA (Syntetos-Boylan Approximation) is evaluated for intermittent demand.
+- SBA metrics use the same 12-month holdout and ROCV scheme as other models.
 
 Regressor candidates (SARIMAX):
 - Only lagged regressors are considered; lag 0 is intentionally excluded.
@@ -259,13 +263,20 @@ Forecast variants:
 - Baseline SARIMA (seasonal) using the selected order.
 - ETS baseline using the same AICc/AIC selection logic as the engine.
 - SARIMAX with the chosen regressor if allowed and future exog is available.
+- SBA (intermittent-demand baseline).
 - ML and Prophet challengers (if enabled).
+- Blended softmax forecast (if holdout history is available), which blends the best-performing model family per horizon.
 
 Stability and post-processing:
 - Forecast horizon is 12 months (`FORECAST_HORIZON = 12`).
 - Forecast values and lower bounds are clipped at `FORECAST_FLOOR = 0.0`.
 - ETS forecasts are validated for stability to avoid extreme or negative values for nonnegative series.
 - The output adds a `recommended_model` boolean based on the chosen model in `sarima_multi_sku_summary.xlsx`.
+- The final output keeps only the recommended model and the blended softmax forecast.
+- Columns `lower_ci`, `upper_ci`, `model_group`, and `model_label` are removed.
+- A `forecast_description` column is appended for business-facing context.
+- The `regressor_names` column remains for traceability.
+- The blended softmax weights sheet is not written in the forecast output.
 
 ### Manual SARIMA order overrides (`Notes.xlsx`)
 If `Notes.xlsx` is present, the scripts will override SARIMA orders per SKU.
@@ -277,8 +288,8 @@ Required columns:
 ### Configuration summary (quick reference)
 Edit these at the top of each script to change behavior:
 - `sarima_order_selector.py`: order grid ranges, ROCV horizon/splits, holdout horizon, minimum series length.
-- `sarima_multi_sku_engine.py`: test horizon, ROCV horizon/min obs, acceptance thresholds, ETS seasonal period, ML/Prophet toggles.
-- `sarima_forecast.py`: forecast horizon, history thresholds for SARIMA/SARIMAX, ETS stability limits, exogenous filling behavior, ML/Prophet toggles.
+- `sarima_multi_sku_engine.py`: test horizon, ROCV horizon/min obs, acceptance thresholds, ETS seasonal period, ML/Prophet toggles, quiet output flags.
+- `sarima_forecast.py`: forecast horizon, history thresholds for SARIMA/SARIMAX, ETS stability limits, exogenous filling behavior, ML/Prophet toggles, quiet output flags, output filtering.
 
 ## Notes
 - Exogenous candidates include lagged Salesforce signals (`New_Opportunities`, `Open_Opportunities`) and `Bookings`; lag logic is explicitly defined in each script.
